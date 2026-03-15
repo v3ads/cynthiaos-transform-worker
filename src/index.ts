@@ -432,7 +432,10 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
         );
       }
 
-      // Insert gold record
+      // Insert gold record — pass dates as plain YYYY-MM-DD strings; Postgres
+      // will coerce them to DATE via the column type. Do NOT concatenate '::date'
+      // inside a tagged template literal as the postgres driver treats interpolated
+      // values as parameters, not raw SQL fragments.
       const goldRows = await sql<GoldLeaseExpiration[]>`
         INSERT INTO gold_lease_expirations
           (bronze_report_id, tenant_id, unit_id, lease_start_date, lease_end_date, days_until_expiration, created_at)
@@ -440,8 +443,8 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
           ${bronze_report_id},
           ${tenantId},
           ${unitId},
-          ${leaseStart ? leaseStart + '::date' : null}::date,
-          ${leaseEnd   ? leaseEnd   + '::date' : null}::date,
+          ${leaseStart},
+          ${leaseEnd},
           ${daysUntilExpiration},
           NOW()
         )
