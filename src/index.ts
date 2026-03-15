@@ -216,6 +216,90 @@ app.post("/transform/test", async (_req: Request, res: Response) => {
   }
 });
 
+// ── POST /transform/run ─────────────────────────────────────────────────────
+// Finds the oldest bronze record with pipeline_metadata stage='bronze',
+// status='created' that has NOT yet been transformed (no silver record exists
+// for it), transforms it, and writes silver + pipeline_metadata records.
+app.post("/transform/run", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+
+    // 1. Find oldest unprocessed bronze record
+    // A bronze record is "unprocessed" when pipeline_metadata has
+    // stage='bronze', status='created' for it and no silver record exists yet.
+    const candidates = await sql<{ bronze_report_id: string; meta_id: string; created_at: Date }[]>`
+      SELECT pm.bronze_report_id, pm.id AS meta_id, pm.created_at
+      FROM pipeline_metadata pm
+      WHERE pm.stage = 'bronze'
+        AND pm.status = 'created'
+        AND pm.bronze_report_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM silver_appfolio_reports s
+          WHERE s.bronze_report_id = pm.bronze_report_id
+        )
+      ORDER BY pm.created_at ASC
+      LIMIT 1
+    `;
+
+    if (candidates.length === 0) {
+      res.status(200).json({
+        success: true,
+        processed: false,
+        message: "No unprocessed bronze records found",
+      });
+      return;
+    }
+
+    const { bronze_report_id, meta_id } = candidates[0];
+    console.log(`[${SERVICE_NAME}] POST /transform/run — found bronze_report_id=${bronze_report_id} meta_id=${meta_id}`);
+
+    // 2. Transform the bronze record (inserts silver + pipeline_metadata silver)
+    const { bronze, silver, meta } = await transformBronzeReport(sql, bronze_report_id);
+
+    // 3. Mark the bronze pipeline_metadata record as 'processed'
+    await sql`
+      UPDATE pipeline_metadata
+      SET status = 'processed', updated_at = NOW()
+      WHERE id = ${meta_id}
+    `;
+    console.log(`[${SERVICE_NAME}] POST /transform/run — marked bronze meta ${meta_id} as processed`);
+
+    res.status(200).json({
+      success: true,
+      processed: true,
+      bronze_report_id: bronze.id,
+      silver_id: silver.id,
+      source_bronze: {
+        id: bronze.id,
+        report_type: bronze.report_type,
+        report_date: bronze.report_date,
+        ingested_at: bronze.ingested_at,
+      },
+      silver: {
+        id: silver.id,
+        bronze_report_id: silver.bronze_report_id,
+        report_type: silver.report_type,
+        report_date: silver.report_date,
+        transformed_at: silver.transformed_at,
+      },
+      pipeline_metadata_silver: {
+        id: meta.id,
+        bronze_report_id: meta.bronze_report_id,
+        stage: meta.stage,
+        status: meta.status,
+        created_at: meta.created_at,
+      },
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] POST /transform/run error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({
