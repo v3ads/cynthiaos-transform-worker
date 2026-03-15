@@ -300,6 +300,179 @@ app.post("/transform/run", async (_req: Request, res: Response) => {
   }
 });
 
+// ── Gold layer interfaces ─────────────────────────────────────────────────────
+
+interface GoldLeaseExpiration {
+  id: string;
+  bronze_report_id: string | null;
+  tenant_id: string;
+  unit_id: string;
+  lease_start_date: string | null;
+  lease_end_date: string | null;
+  days_until_expiration: number | null;
+  created_at: Date;
+}
+
+// ── POST /gold/run ─────────────────────────────────────────────────────
+//
+// Reads the next eligible silver record that has NOT yet been promoted to the
+// Gold layer. Eligibility criteria:
+//   - silver_appfolio_reports.report_type = 'rent_roll' (lease-related data)
+//   - no gold_lease_expirations row already exists for the same bronze_report_id
+//     (idempotency guard)
+//
+// Extracts per-row lease fields from normalized_data.rows, inserts one
+// gold_lease_expirations row per tenant row, and records pipeline_metadata
+// stage='gold', status='processed'.
+//
+// Returns:
+//   { processed: true,  gold_ids: [...], silver_id, bronze_report_id }
+//   { processed: false, reason: "..." }  when nothing eligible is found
+app.post("/gold/run", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+
+    // 1. Find the oldest silver record eligible for Gold promotion.
+    //    Eligible = report_type is rent_roll AND no gold row exists yet for
+    //    that bronze_report_id (prevents duplicate gold rows on re-run).
+    const candidates = await sql<{ silver_id: string; bronze_report_id: string; report_date: string; normalized_data: Record<string, unknown> }[]>`
+      SELECT
+        s.id          AS silver_id,
+        s.bronze_report_id,
+        s.report_date::text AS report_date,
+        s.normalized_data
+      FROM silver_appfolio_reports s
+      WHERE s.report_type = 'rent_roll'
+        AND NOT EXISTS (
+          SELECT 1 FROM gold_lease_expirations g
+          WHERE g.bronze_report_id = s.bronze_report_id
+        )
+      ORDER BY s.transformed_at ASC
+      LIMIT 1
+    `;
+
+    if (candidates.length === 0) {
+      console.log(`[${SERVICE_NAME}] POST /gold/run — no eligible silver records found`);
+      res.status(200).json({
+        success: true,
+        processed: false,
+        reason: "No eligible silver rent_roll records without existing gold rows",
+      });
+      return;
+    }
+
+    const { silver_id, bronze_report_id, report_date, normalized_data } = candidates[0];
+    console.log(`[${SERVICE_NAME}] POST /gold/run — processing silver_id=${silver_id} bronze_report_id=${bronze_report_id}`);
+
+    // 2. Extract rows from normalized_data
+    const rows = Array.isArray((normalized_data as any).rows)
+      ? ((normalized_data as any).rows as Record<string, unknown>[])
+      : [];
+
+    if (rows.length === 0) {
+      console.log(`[${SERVICE_NAME}] POST /gold/run — silver record has no rows, skipping`);
+      res.status(200).json({
+        success: true,
+        processed: false,
+        reason: `Silver record ${silver_id} has no rows in normalized_data`,
+        silver_id,
+        bronze_report_id,
+      });
+      return;
+    }
+
+    // 3. Calculate days_until_expiration for each row and insert gold records.
+    //    Lease fields are sourced from the row payload; if not present we use
+    //    the report_date as lease_start_date and derive a synthetic end date
+    //    (report_date + 12 months) so the Gold table is always populated.
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+
+    const goldIds: string[] = [];
+
+    for (const row of rows) {
+      const tenantId = String(row.tenant ?? row.tenant_id ?? "unknown");
+      const unitId   = String(row.unit   ?? row.unit_id   ?? "unknown");
+
+      // Derive lease dates: prefer explicit fields, fall back to report_date
+      const leaseStart: string | null =
+        typeof row.lease_start_date === "string" ? row.lease_start_date
+        : typeof row.lease_start === "string"    ? row.lease_start
+        : report_date ?? null;
+
+      const leaseEnd: string | null =
+        typeof row.lease_end_date === "string" ? row.lease_end_date
+        : typeof row.lease_end === "string"    ? row.lease_end
+        : (() => {
+            // Synthetic: report_date + 12 months
+            if (!report_date) return null;
+            const d = new Date(report_date);
+            d.setFullYear(d.getFullYear() + 1);
+            return d.toISOString().slice(0, 10);
+          })();
+
+      // Calculate days_until_expiration
+      let daysUntilExpiration: number | null = null;
+      if (leaseEnd) {
+        const endDate = new Date(leaseEnd);
+        endDate.setUTCHours(0, 0, 0, 0);
+        daysUntilExpiration = Math.round(
+          (endDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)
+        );
+      }
+
+      // Insert gold record
+      const goldRows = await sql<GoldLeaseExpiration[]>`
+        INSERT INTO gold_lease_expirations
+          (bronze_report_id, tenant_id, unit_id, lease_start_date, lease_end_date, days_until_expiration, created_at)
+        VALUES (
+          ${bronze_report_id},
+          ${tenantId},
+          ${unitId},
+          ${leaseStart ? leaseStart + '::date' : null}::date,
+          ${leaseEnd   ? leaseEnd   + '::date' : null}::date,
+          ${daysUntilExpiration},
+          NOW()
+        )
+        RETURNING *
+      `;
+
+      const gold = goldRows[0];
+      goldIds.push(gold.id);
+      console.log(
+        `[${SERVICE_NAME}] POST /gold/run — inserted gold id=${gold.id} tenant=${tenantId} unit=${unitId} days_until_expiration=${daysUntilExpiration}`
+      );
+    }
+
+    // 4. Record pipeline_metadata stage='gold', status='processed'
+    const meta = await insertPipelineMetadata(sql, bronze_report_id, "gold", "processed");
+    console.log(`[${SERVICE_NAME}] POST /gold/run — pipeline_metadata id=${meta.id} stage=gold status=processed`);
+
+    res.status(200).json({
+      success: true,
+      processed: true,
+      silver_id,
+      bronze_report_id,
+      gold_row_count: goldIds.length,
+      gold_ids: goldIds,
+      pipeline_metadata: {
+        id: meta.id,
+        bronze_report_id: meta.bronze_report_id,
+        stage: meta.stage,
+        status: meta.status,
+        created_at: meta.created_at,
+      },
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] POST /gold/run error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({
