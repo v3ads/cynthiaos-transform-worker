@@ -362,8 +362,18 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
       return;
     }
 
-    const { silver_id, bronze_report_id, report_date, normalized_data } = candidates[0];
-    console.log(`[${SERVICE_NAME}] POST /gold/run — processing silver_id=${silver_id} bronze_report_id=${bronze_report_id}`);
+    const raw = candidates[0];
+    const silver_id = raw.silver_id;
+    const bronze_report_id = raw.bronze_report_id;
+    const normalized_data = raw.normalized_data;
+    // Normalize report_date: postgres may return a Date object despite ::text cast
+    const rdRaw: unknown = raw.report_date;
+    const report_date: string | null = rdRaw
+      ? (rdRaw instanceof Date
+          ? rdRaw.toISOString().slice(0, 10)
+          : String(rdRaw).slice(0, 10))
+      : null;
+    console.log(`[${SERVICE_NAME}] POST /gold/run — processing silver_id=${silver_id} bronze_report_id=${bronze_report_id} report_date=${report_date}`);
 
     // 2. Extract rows from normalized_data
     const rows = Array.isArray((normalized_data as any).rows)
