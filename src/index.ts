@@ -58,6 +58,33 @@ interface SilverAppfolioReport {
   transformed_at: Date;
 }
 
+interface PipelineMetadata {
+  id: string;
+  bronze_report_id: string | null;
+  stage: string;
+  status: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
+// ── Pipeline metadata ─────────────────────────────────────────────────────────
+
+async function insertPipelineMetadata(
+  sql: postgres.Sql,
+  bronzeReportId: string | null,
+  stage: string,
+  status: string
+): Promise<PipelineMetadata> {
+  const rows = await sql<PipelineMetadata[]>`
+    INSERT INTO pipeline_metadata (bronze_report_id, stage, status, created_at, updated_at)
+    VALUES (${bronzeReportId}, ${stage}, ${status}, NOW(), NOW())
+    RETURNING *
+  `;
+  const meta = rows[0];
+  console.log(`[${SERVICE_NAME}] insertPipelineMetadata — id=${meta.id} stage=${meta.stage} status=${meta.status} bronze_report_id=${meta.bronze_report_id}`);
+  return meta;
+}
+
 // ── Normalize bronze payload into silver structure ────────────────────────────
 
 function normalizeBronzePayload(bronze: BronzeAppfolioReport): Record<string, unknown> {
@@ -97,7 +124,7 @@ function normalizeBronzePayload(bronze: BronzeAppfolioReport): Record<string, un
 async function transformBronzeReport(
   sql: postgres.Sql,
   bronzeId?: string
-): Promise<{ bronze: BronzeAppfolioReport; silver: SilverAppfolioReport }> {
+): Promise<{ bronze: BronzeAppfolioReport; silver: SilverAppfolioReport; meta: PipelineMetadata }> {
   let bronzeRows: BronzeAppfolioReport[];
 
   if (bronzeId) {
@@ -142,7 +169,10 @@ async function transformBronzeReport(
   const silver = silverRows[0];
   console.log(`[${SERVICE_NAME}] transformBronzeReport — inserted silver id=${silver.id}`);
 
-  return { bronze, silver };
+  // Insert pipeline_metadata — silver stage processed
+  const meta = await insertPipelineMetadata(sql, bronze.id, "silver", "processed");
+
+  return { bronze, silver, meta };
 }
 
 // ── POST /transform/test ──────────────────────────────────────────────────────
@@ -150,7 +180,7 @@ app.post("/transform/test", async (_req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const { bronze, silver } = await transformBronzeReport(sql);
+    const { bronze, silver, meta } = await transformBronzeReport(sql);
 
     res.status(200).json({
       success: true,
@@ -162,6 +192,13 @@ app.post("/transform/test", async (_req: Request, res: Response) => {
         report_date: silver.report_date,
         normalized_data: silver.normalized_data,
         transformed_at: silver.transformed_at,
+      },
+      pipeline_metadata: {
+        id: meta.id,
+        bronze_report_id: meta.bronze_report_id,
+        stage: meta.stage,
+        status: meta.status,
+        created_at: meta.created_at,
       },
       source_bronze: {
         id: bronze.id,
