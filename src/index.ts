@@ -1,9 +1,34 @@
 import express, { Request, Response } from "express";
 import postgres from "postgres";
+import http from "http";
 
 const app = express();
 const PORT = parseInt(process.env.PORT ?? "3002", 10);
 const SERVICE_NAME = "cynthiaos-transform-worker";
+
+// ── Internal self-call helper ─────────────────────────────────────────────────
+// Fires an HTTP POST to a path on this same service (localhost:PORT).
+// Used to chain /gold/run after /transform/run without an external round-trip.
+function selfPost(path: string): void {
+  const options = {
+    hostname: "127.0.0.1",
+    port: PORT,
+    path,
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Content-Length": 0 },
+  };
+  const req = http.request(options, (res) => {
+    let body = "";
+    res.on("data", (chunk) => { body += chunk; });
+    res.on("end", () => {
+      console.log(`[${SERVICE_NAME}] selfPost ${path} → HTTP ${res.statusCode} — ${body.slice(0, 200)}`);
+    });
+  });
+  req.on("error", (err) => {
+    console.error(`[${SERVICE_NAME}] selfPost ${path} error:`, err.message);
+  });
+  req.end();
+}
 
 app.use(express.json());
 
@@ -291,6 +316,11 @@ app.post("/transform/run", async (_req: Request, res: Response) => {
         created_at: meta.created_at,
       },
     });
+
+    // Auto-trigger Gold layer promotion — same fire-and-log pattern used by
+    // ingestion-worker when it auto-triggers /transform/run.
+    console.log(`[${SERVICE_NAME}] POST /transform/run — auto-triggering POST /gold/run`);
+    selfPost("/gold/run");
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] POST /transform/run error:`, message);
