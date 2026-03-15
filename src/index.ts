@@ -1,4 +1,5 @@
 import express, { Request, Response } from "express";
+import postgres from "postgres";
 
 const app = express();
 const PORT = parseInt(process.env.PORT ?? "3002", 10);
@@ -6,12 +7,188 @@ const SERVICE_NAME = "cynthiaos-transform-worker";
 
 app.use(express.json());
 
+// ── Database client ───────────────────────────────────────────────────────────
+function getDb(): postgres.Sql {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    throw new Error("DATABASE_URL environment variable is not set");
+  }
+  return postgres(databaseUrl, { ssl: "require", max: 5, idle_timeout: 30 });
+}
+
+// ── Database connectivity state ───────────────────────────────────────────────
+let dbConnected = false;
+let dbTimestamp: string | null = null;
+
+async function checkDatabaseConnectivity(): Promise<void> {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    console.log(`[${SERVICE_NAME}] DATABASE_URL not set — skipping DB check`);
+    return;
+  }
+  try {
+    const sql = getDb();
+    const result = await sql`SELECT NOW() AS now`;
+    dbTimestamp = result[0].now.toISOString();
+    dbConnected = true;
+    console.log(`[${SERVICE_NAME}] DB connectivity verified — SELECT NOW() = ${dbTimestamp}`);
+    await sql.end();
+  } catch (err) {
+    console.error(`[${SERVICE_NAME}] DB connectivity check FAILED:`, err);
+    dbConnected = false;
+  }
+}
+
+// ── Interfaces ────────────────────────────────────────────────────────────────
+
+interface BronzeAppfolioReport {
+  id: string;
+  report_type: string;
+  report_date: string;
+  raw_data: Record<string, unknown>;
+  ingested_at: Date;
+}
+
+interface SilverAppfolioReport {
+  id: string;
+  bronze_report_id: string;
+  report_type: string;
+  report_date: string;
+  normalized_data: Record<string, unknown>;
+  transformed_at: Date;
+}
+
+// ── Normalize bronze payload into silver structure ────────────────────────────
+
+function normalizeBronzePayload(bronze: BronzeAppfolioReport): Record<string, unknown> {
+  const raw = bronze.raw_data as Record<string, unknown>;
+  const rows = Array.isArray(raw.rows) ? (raw.rows as Record<string, unknown>[]) : [];
+  const summary = (raw.summary ?? {}) as Record<string, unknown>;
+
+  return {
+    source: "appfolio",
+    report_type: bronze.report_type,
+    report_date: bronze.report_date,
+    bronze_report_id: bronze.id,
+    transformed_at: new Date().toISOString(),
+    row_count: rows.length,
+    rows: rows.map((r) => ({
+      property_id: r.property_id ?? null,
+      unit: r.unit ?? null,
+      tenant: r.tenant ?? null,
+      rent: typeof r.rent === "number" ? r.rent : null,
+      status: r.status ?? null,
+    })),
+    summary: {
+      total_units: summary.total_units ?? rows.length,
+      total_rent:
+        summary.total_rent ??
+        rows.reduce(
+          (acc, r) => acc + (typeof r.rent === "number" ? r.rent : 0),
+          0
+        ),
+      occupancy_rate: summary.occupancy_rate ?? null,
+    },
+  };
+}
+
+// ── transformBronzeReport ─────────────────────────────────────────────────────
+
+async function transformBronzeReport(
+  sql: postgres.Sql,
+  bronzeId?: string
+): Promise<{ bronze: BronzeAppfolioReport; silver: SilverAppfolioReport }> {
+  let bronzeRows: BronzeAppfolioReport[];
+
+  if (bronzeId) {
+    bronzeRows = await sql<BronzeAppfolioReport[]>`
+      SELECT * FROM bronze_appfolio_reports WHERE id = ${bronzeId} LIMIT 1
+    `;
+  } else {
+    bronzeRows = await sql<BronzeAppfolioReport[]>`
+      SELECT * FROM bronze_appfolio_reports ORDER BY ingested_at DESC LIMIT 1
+    `;
+  }
+
+  if (bronzeRows.length === 0) {
+    throw new Error("No bronze report found to transform");
+  }
+
+  const bronze = bronzeRows[0];
+  console.log(
+    `[${SERVICE_NAME}] transformBronzeReport — reading bronze id=${bronze.id} type=${bronze.report_type}`
+  );
+
+  const normalizedData = normalizeBronzePayload(bronze);
+
+  const reportDateStr =
+    typeof bronze.report_date === "string"
+      ? bronze.report_date
+      : new Date(bronze.report_date).toISOString().slice(0, 10);
+
+  const silverRows = await sql<SilverAppfolioReport[]>`
+    INSERT INTO silver_appfolio_reports
+      (bronze_report_id, report_type, report_date, normalized_data, transformed_at)
+    VALUES (
+      ${bronze.id},
+      ${bronze.report_type},
+      ${reportDateStr}::date,
+      ${sql.json(normalizedData as any)},
+      NOW()
+    )
+    RETURNING *
+  `;
+
+  const silver = silverRows[0];
+  console.log(`[${SERVICE_NAME}] transformBronzeReport — inserted silver id=${silver.id}`);
+
+  return { bronze, silver };
+}
+
+// ── POST /transform/test ──────────────────────────────────────────────────────
+app.post("/transform/test", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const { bronze, silver } = await transformBronzeReport(sql);
+
+    res.status(200).json({
+      success: true,
+      silver_id: silver.id,
+      silver: {
+        id: silver.id,
+        bronze_report_id: silver.bronze_report_id,
+        report_type: silver.report_type,
+        report_date: silver.report_date,
+        normalized_data: silver.normalized_data,
+        transformed_at: silver.transformed_at,
+      },
+      source_bronze: {
+        id: bronze.id,
+        report_type: bronze.report_type,
+        report_date: bronze.report_date,
+        ingested_at: bronze.ingested_at,
+      },
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] POST /transform/test error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({
     service: SERVICE_NAME,
     status: "ok",
     timestamp: new Date().toISOString(),
+    db: {
+      connected: dbConnected,
+      verified_at: dbTimestamp,
+    },
   });
 });
 
@@ -21,8 +198,9 @@ app.use((_req: Request, res: Response) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[${SERVICE_NAME}] listening on port ${PORT}`);
+  await checkDatabaseConnectivity();
 });
 
 export default app;
