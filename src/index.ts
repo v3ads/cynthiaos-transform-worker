@@ -200,6 +200,27 @@ async function transformBronzeReport(
   return { bronze, silver, meta };
 }
 
+// ── triggerGold — fire-and-forget internal call to POST /gold/run ────────────
+// Mirrors the triggerTransform pattern in ingestion-worker.
+// Called after a Silver insert completes so the full Bronze→Silver→Gold chain
+// runs automatically from a single POST /ingest/report call.
+async function triggerGold(): Promise<void> {
+  const port = process.env.PORT ?? "3002";
+  const url = `http://localhost:${port}/gold/run`;
+  try {
+    const resp = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" } });
+    const body = await resp.json() as Record<string, unknown>;
+    if (body.processed) {
+      console.log(`[${SERVICE_NAME}] triggerGold — gold promotion succeeded gold_ids=${JSON.stringify(body.gold_ids)}`);
+    } else {
+      console.log(`[${SERVICE_NAME}] triggerGold — gold/run responded: processed=false reason=${body.reason ?? "unknown"}`);
+    }
+  } catch (err) {
+    // Non-fatal: log and continue — the Silver record is already committed
+    console.warn(`[${SERVICE_NAME}] triggerGold — fire-and-forget call failed (non-fatal):`, err);
+  }
+}
+
 // ── POST /transform/test ──────────────────────────────────────────────────────
 app.post("/transform/test", async (_req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
@@ -289,6 +310,10 @@ app.post("/transform/run", async (_req: Request, res: Response) => {
       WHERE id = ${meta_id}
     `;
     console.log(`[${SERVICE_NAME}] POST /transform/run — marked bronze meta ${meta_id} as processed`);
+
+    // 4. Auto-trigger Gold promotion (fire-and-forget — Silver is already committed)
+    triggerGold().catch(() => { /* already logged inside triggerGold */ });
+    console.log(`[${SERVICE_NAME}] POST /transform/run — Gold promotion triggered`);
 
     res.status(200).json({
       success: true,
