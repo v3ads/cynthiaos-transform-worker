@@ -342,10 +342,9 @@ app.post("/transform/run", async (_req: Request, res: Response) => {
       },
     });
 
-    // Auto-trigger Gold layer promotion — same fire-and-log pattern used by
-    // ingestion-worker when it auto-triggers /transform/run.
-    console.log(`[${SERVICE_NAME}] POST /transform/run — auto-triggering POST /gold/run`);
-    selfPost("/gold/run");
+    // Note: triggerGold() above (fire-and-forget fetch) is the sole Gold trigger.
+    // The selfPost("/gold/run") duplicate has been removed to prevent the race
+    // condition that caused duplicate gold rows (TASK-029 idempotency fix).
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] POST /transform/run error:`, message);
@@ -503,6 +502,7 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
           ${daysUntilExpiration},
           NOW()
         )
+        ON CONFLICT (bronze_report_id, tenant_id, unit_id) DO NOTHING
         RETURNING *
       `;
 
