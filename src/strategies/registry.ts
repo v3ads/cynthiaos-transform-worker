@@ -16,6 +16,7 @@ import { delinquencyStrategy } from "./delinquency";
 import { agedReceivablesStrategy } from "./aged_receivables";
 import { tenantDirectoryStrategy } from "./tenant_directory";
 import { incomeStatementStrategy } from "./income_statement";
+import { occupancySummaryStrategy } from "./occupancy_summary";
 import { unsupportedStrategy } from "./unsupported";
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -27,9 +28,9 @@ const TRANSFORM_STRATEGIES: Record<string, TransformStrategy> = {
   aged_receivables:    agedReceivablesStrategy,
   tenant_directory:    tenantDirectoryStrategy,
   income_statement:    incomeStatementStrategy,
+  occupancy_summary:   occupancySummaryStrategy,
 
   // ── Planned (add handlers here as they are implemented) ──────────────────
-  // occupancy_summary:   occupancySummaryStrategy,
   // move_in_move_out:    moveInMoveOutStrategy,
   // maintenance_request: maintenanceRequestStrategy,
   // ... (28 more report types)
