@@ -12,16 +12,17 @@
 
 import { TransformStrategy } from "../types";
 import { rentRollStrategy } from "./rent_roll";
+import { delinquencyStrategy } from "./delinquency";
 import { unsupportedStrategy } from "./unsupported";
 
 // ── Registry ──────────────────────────────────────────────────────────────────
 
 const TRANSFORM_STRATEGIES: Record<string, TransformStrategy> = {
   // ── Implemented ──────────────────────────────────────────────────────────
-  rent_roll: rentRollStrategy,
+  rent_roll:   rentRollStrategy,
+  delinquency: delinquencyStrategy,
 
   // ── Planned (add handlers here as they are implemented) ──────────────────
-  // delinquency:         delinquencyStrategy,
   // tenant_directory:    tenantDirectoryStrategy,
   // aged_receivables:    agedReceivablesStrategy,
   // income_statement:    incomeStatementStrategy,
