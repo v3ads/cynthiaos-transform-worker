@@ -53,12 +53,16 @@ function toNum(val: unknown): number {
 
 function toDateStr(val: unknown, fallback: string): string {
   if (!val) return fallback;
+  // Handle Date objects returned by the postgres driver for DATE columns
+  if (val instanceof Date) return val.toISOString().slice(0, 10);
   const s = String(val).trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
   if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
     const [m, d, y] = s.split("/");
     return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
   }
+  // Handle ISO datetime strings like "2025-03-31T00:00:00.000Z"
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return s.slice(0, 10);
   return fallback;
 }
 
@@ -123,10 +127,15 @@ export const incomeStatementStrategy: TransformStrategy = {
   normalizeSilver(ctx: TransformContext): SilverNormalizeResult {
     const raw     = ctx.bronze.raw_data;
     const today   = new Date().toISOString().slice(0, 10);
-    const reportDate = toDateStr(
-      ctx.bronze.report_date ?? raw.report_date ?? raw.period_end ?? raw.as_of_date,
-      today
-    );
+    // ctx.reportDate is the pre-computed YYYY-MM-DD string from the transform worker
+    // (derived from bronze.report_date before the strategy is called).
+    // Fall back to raw payload fields, then today as last resort.
+    const reportDate =
+      ctx.reportDate ||
+      toDateStr(
+        ctx.bronze.report_date ?? raw.report_date ?? raw.period_end ?? raw.as_of_date,
+        today
+      );
 
     // Support two payload shapes:
     //   1. Flat summary: { total_income, rental_income, ... }
