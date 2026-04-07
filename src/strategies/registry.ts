@@ -14,6 +14,7 @@ import { TransformStrategy } from "../types";
 import { rentRollStrategy } from "./rent_roll";
 import { delinquencyStrategy } from "./delinquency";
 import { agedReceivablesStrategy } from "./aged_receivables";
+import { tenantDirectoryStrategy } from "./tenant_directory";
 import { unsupportedStrategy } from "./unsupported";
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -22,10 +23,10 @@ const TRANSFORM_STRATEGIES: Record<string, TransformStrategy> = {
   // ── Implemented ──────────────────────────────────────────────────────────
   rent_roll:          rentRollStrategy,
   delinquency:        delinquencyStrategy,
-  aged_receivables:   agedReceivablesStrategy,
+  aged_receivables:    agedReceivablesStrategy,
+  tenant_directory:    tenantDirectoryStrategy,
 
   // ── Planned (add handlers here as they are implemented) ──────────────────
-  // tenant_directory:    tenantDirectoryStrategy,
   // income_statement:    incomeStatementStrategy,
   // occupancy_summary:   occupancySummaryStrategy,
   // move_in_move_out:    moveInMoveOutStrategy,
