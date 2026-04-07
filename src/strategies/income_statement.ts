@@ -223,10 +223,18 @@ export const incomeStatementStrategy: TransformStrategy = {
     const profitMargin    = typeof s.profit_margin === "number" ? s.profit_margin
                           : deriveProfitMargin(noi, totalIncome);
 
+    // Compute a stable content hash so that re-uploading identical data for the
+    // same period does not create duplicate Gold rows, regardless of bronze_report_id.
+    const contentHash = require("crypto")
+      .createHash("md5")
+      .update(`${reportDate}|${totalIncome}|${totalExpenses}|${noi}`)
+      .digest("hex");
+
     const goldRows = await sql<GoldIncomeStatement[]>`
       INSERT INTO gold_income_statements
         (bronze_report_id, report_date, total_income, rental_income, other_income,
-         total_expenses, operating_expenses, net_operating_income, profit_margin, created_at)
+         total_expenses, operating_expenses, net_operating_income, profit_margin,
+         content_hash, created_at)
       VALUES (
         ${bronze.id},
         ${reportDate}::date,
@@ -237,9 +245,10 @@ export const incomeStatementStrategy: TransformStrategy = {
         ${opex},
         ${noi},
         ${profitMargin},
+        ${contentHash},
         NOW()
       )
-      ON CONFLICT (bronze_report_id) DO NOTHING
+      ON CONFLICT (report_date, content_hash) DO NOTHING
       RETURNING *
     `;
 

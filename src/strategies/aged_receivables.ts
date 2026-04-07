@@ -15,6 +15,7 @@ import {
   GoldPromoteResult,
   SilverAppfolioReport,
 } from "../types";
+import { normalizeTenantId, normalizeUnitId } from "../utils/normalize";
 
 // ── Gold row interface ────────────────────────────────────────────────────────
 
@@ -89,8 +90,10 @@ export const agedReceivablesStrategy: TransformStrategy = {
 
     const normalizedRows = rows.map((r) => {
       // Support multiple AppFolio field name variants
-      const tenantId = String(r.tenant ?? r.tenant_id ?? r.tenant_name ?? "unknown");
-      const unitId   = String(r.unit   ?? r.unit_id   ?? r.unit_number  ?? "unknown");
+      const rawName  = String(r.tenant ?? r.tenant_id ?? r.tenant_name ?? r.name ?? r.resident ?? "");
+      const rawUnit  = String(r.unit   ?? r.unit_id   ?? r.unit_number  ?? "");
+      const tenantId = normalizeTenantId(rawName, rawUnit);
+      const unitId   = normalizeUnitId(rawUnit);
 
       const b0_30   = toNum(r.bucket_0_30   ?? r["0_30"]   ?? r.current    ?? r.current_balance    ?? 0);
       const b31_60  = toNum(r.bucket_31_60  ?? r["31_60"]  ?? r.days_31_60 ?? r.balance_31_60      ?? 0);

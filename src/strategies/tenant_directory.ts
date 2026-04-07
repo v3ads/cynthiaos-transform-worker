@@ -21,6 +21,7 @@ import {
   GoldPromoteResult,
   SilverAppfolioReport,
 } from "../types";
+import { normalizeTenantId, normalizeUnitId } from "../utils/normalize";
 
 // ── Gold row interface ────────────────────────────────────────────────────────
 
@@ -40,24 +41,7 @@ interface GoldTenant {
 }
 
 // ── Identity normalisation ────────────────────────────────────────────────────
-
-/**
- * Derive a stable, normalised tenant_id from name + unit.
- * Rules:
- *   1. Trim whitespace
- *   2. Lowercase
- *   3. Replace any run of non-alphanumeric chars with a single underscore
- *   4. Strip leading/trailing underscores
- *
- * Example: "  Maria Santos " + "101" → "maria_santos_101"
- */
-function normalizeTenantId(name: string, unit: string): string {
-  const raw = `${name.trim()}_${unit.trim()}`;
-  return raw
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-}
+// normalizeTenantId and normalizeUnitId are imported from ../utils/normalize
 
 function normalizeLeaseStatus(raw: unknown): string {
   if (!raw) return "unknown";

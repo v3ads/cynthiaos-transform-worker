@@ -12,6 +12,7 @@ import {
   GoldPromoteResult,
   SilverAppfolioReport,
 } from "../types";
+import { normalizeTenantId, normalizeUnitId } from "../utils/normalize";
 
 // ── Gold row interface ────────────────────────────────────────────────────────
 
@@ -63,9 +64,11 @@ export const delinquencyStrategy: TransformStrategy = {
         : typeof r.last_paid === "string" ? r.last_paid
         : null;
 
+      const rawName = String(r.tenant ?? r.tenant_id ?? r.tenant_name ?? r.name ?? r.resident ?? "");
+      const rawUnit = String(r.unit   ?? r.unit_id   ?? r.unit_number ?? "");
       return {
-        tenant_id: String(r.tenant ?? r.tenant_id ?? r.tenant_name ?? "unknown"),
-        unit_id:   String(r.unit   ?? r.unit_id   ?? r.unit_number  ?? "unknown"),
+        tenant_id: normalizeTenantId(rawName, rawUnit),
+        unit_id:   normalizeUnitId(rawUnit),
         balance_due: balanceDue,
         days_overdue: daysOverdue,
         last_payment_date: lastPaymentDate,

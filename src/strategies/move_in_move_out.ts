@@ -17,6 +17,7 @@ import {
   GoldPromoteResult,
   SilverAppfolioReport,
 } from "../types.js";
+import { normalizeTenantId as _normalizeTenantId, normalizeUnitId } from "../utils/normalize";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -34,14 +35,9 @@ function toDateStr(val: unknown): string | null {
   return null;
 }
 
+// Wrap shared utility to match the single-arg call signature used in this file
 function normalizeTenantId(val: unknown): string {
-  if (!val) return "unknown";
-  return String(val).trim().toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_-]/g, "");
-}
-
-function normalizeUnitId(val: unknown): string {
-  if (!val) return "unknown";
-  return String(val).trim().toLowerCase().replace(/\s+/g, "_");
+  return _normalizeTenantId(val, "");
 }
 
 // ── Normalised event type ─────────────────────────────────────────────────────

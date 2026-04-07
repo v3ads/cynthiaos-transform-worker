@@ -200,6 +200,12 @@ export const occupancySummaryStrategy: TransformStrategy = {
       vacancy_rate:   number | null;
     };
 
+    // Compute a stable content hash for idempotency across re-uploads
+    const contentHash = require("crypto")
+      .createHash("md5")
+      .update(`${nd.report_date}|${nd.total_units}|${nd.occupied_units}|${nd.vacant_units}`)
+      .digest("hex");
+
     const rows = await ctx.sql`
       INSERT INTO gold_occupancy_snapshots (
         bronze_report_id,
@@ -208,7 +214,8 @@ export const occupancySummaryStrategy: TransformStrategy = {
         occupied_units,
         vacant_units,
         occupancy_rate,
-        vacancy_rate
+        vacancy_rate,
+        content_hash
       ) VALUES (
         ${ctx.bronze.id},
         ${nd.report_date},
@@ -216,9 +223,10 @@ export const occupancySummaryStrategy: TransformStrategy = {
         ${nd.occupied_units},
         ${nd.vacant_units},
         ${nd.occupancy_rate},
-        ${nd.vacancy_rate}
+        ${nd.vacancy_rate},
+        ${contentHash}
       )
-      ON CONFLICT (bronze_report_id) DO NOTHING
+      ON CONFLICT (report_date, content_hash) DO NOTHING
       RETURNING id
     `;
 

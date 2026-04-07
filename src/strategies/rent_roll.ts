@@ -12,6 +12,7 @@ import {
   SilverAppfolioReport,
   GoldLeaseExpiration,
 } from "../types";
+import { normalizeTenantId, normalizeUnitId } from "../utils/normalize";
 
 export const rentRollStrategy: TransformStrategy = {
   // ── Silver normalisation ──────────────────────────────────────────────────
@@ -78,8 +79,10 @@ export const rentRollStrategy: TransformStrategy = {
     const goldIds: string[] = [];
 
     for (const row of rows) {
-      const tenantId = String(row.tenant ?? row.tenant_id ?? "unknown");
-      const unitId   = String(row.unit   ?? row.unit_id   ?? "unknown");
+      const rawName  = String(row.tenant ?? row.tenant_id ?? row.name ?? row.resident ?? "");
+      const rawUnit  = String(row.unit   ?? row.unit_id   ?? "");
+      const tenantId = normalizeTenantId(rawName, rawUnit);
+      const unitId   = normalizeUnitId(rawUnit);
 
       // Derive lease dates: prefer explicit fields, fall back to report_date
       const leaseStart: string | null =
