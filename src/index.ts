@@ -315,7 +315,24 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
     sql = getDb();
 
     // Find the oldest Silver record that has NOT yet been promoted to Gold.
-    // No report_type filter — the strategy decides what to do.
+    // Only process report types with registered Gold strategies — unsupported types
+    // are marked as skipped immediately via a bulk UPDATE rather than one-by-one.
+    const supportedTypes = getSupportedTypes();
+
+    // Bulk-skip all unsupported Silver records that are still pending Gold promotion
+    // so they never block the queue again.
+    await sql`
+      INSERT INTO pipeline_metadata (bronze_report_id, stage, status)
+      SELECT s.bronze_report_id, 'gold', 'skipped'
+      FROM silver_appfolio_reports s
+      WHERE s.report_type != ALL(${supportedTypes})
+        AND NOT EXISTS (
+          SELECT 1 FROM pipeline_metadata pm
+          WHERE pm.bronze_report_id = s.bronze_report_id AND pm.stage = 'gold'
+        )
+      ON CONFLICT DO NOTHING
+    `;
+
     const candidates = await sql<{
       silver_id: string;
       bronze_report_id: string;
@@ -330,11 +347,12 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
         s.report_date::text AS report_date,
         s.normalized_data
       FROM silver_appfolio_reports s
-      WHERE NOT EXISTS (
-        SELECT 1 FROM pipeline_metadata pm
-        WHERE pm.bronze_report_id = s.bronze_report_id
-          AND pm.stage = 'gold'
-      )
+      WHERE s.report_type = ANY(${supportedTypes})
+        AND NOT EXISTS (
+          SELECT 1 FROM pipeline_metadata pm
+          WHERE pm.bronze_report_id = s.bronze_report_id
+            AND pm.stage = 'gold'
+        )
       ORDER BY s.transformed_at ASC
       LIMIT 1
     `;
