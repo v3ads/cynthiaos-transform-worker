@@ -163,6 +163,7 @@ export const unitTurnDetailStrategy: TransformStrategy = {
         INSERT INTO gold_unit_turnover (
           bronze_report_id,
           unit_id,
+          event_type,
           move_out_date,
           expected_move_in_date,
           turn_end_date,
@@ -173,6 +174,7 @@ export const unitTurnDetailStrategy: TransformStrategy = {
         ) VALUES (
           ${bronze.id},
           ${unitId},
+          ${'turn'},
           ${moveOutDate},
           ${expectedMoveInDate},
           ${turnEndDate},
