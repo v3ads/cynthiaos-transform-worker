@@ -77,7 +77,8 @@ const GOLD_TABLES: TableSpec[] = [
     ],
   },
   {
-    table: "gold_rent_roll",
+    // rent_roll strategy promotes into gold_lease_expirations — no separate gold_rent_roll table
+    table: "gold_lease_expirations",
     critical: true,
     minRows: 50,
     badValueChecks: [
