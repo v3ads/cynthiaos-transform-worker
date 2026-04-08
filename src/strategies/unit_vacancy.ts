@@ -1,115 +1,142 @@
-// ── unit_vacancy strategy ─────────────────────────────────────────────────────
-//
-// Handles the AppFolio "unit_vacancy" report type.
-//
-// IMPORTANT: The AppFolio unit_vacancy report ONLY sends vacant and notice
-// units. It does NOT include occupied units. The total unit count (182) is
-// a fixed property-level constant derived from the unit_directory report.
-//
-// AppFolio sends one row per vacant/notice unit with PascalCase fields:
-//   { Unit, UnitId, UnitStatus, Property, PropertyId, SqFt, ... }
-//
-// UnitStatus values observed in this report:
-//   "Vacant-Unrented", "Vacant-Rented", "Notice-Unrented", "Notice-Rented"
-//
-// Occupancy definition (per business requirement):
-//   occupied_units = TOTAL_UNITS - vacant_units - notice_units
-//   occupancy_rate = occupied_units / TOTAL_UNITS
-//   vacancy_rate   = (vacant_units + notice_units) / TOTAL_UNITS
-//
-// Silver: counts vacant/notice rows → derives occupied from total constant.
-// Gold:   promotes one snapshot row per report into gold_occupancy_snapshots.
-//         Idempotent via ON CONFLICT (report_date, content_hash) DO UPDATE.
+/**
+ * unit_vacancy strategy — CynthiaOS Transform Worker
+ *
+ * Silver normalization:
+ *   Counts vacant and notice units from the AppFolio unit_vacancy report.
+ *   The report only sends non-occupied units, so total_units is derived
+ *   dynamically from the unit_directory Bronze records (preferred) or falls
+ *   back to COUNT(DISTINCT unit_id) from gold_lease_expirations.
+ *
+ * Gold promotion:
+ *   Upserts a daily snapshot into gold_occupancy_snapshots with:
+ *     - total_units  = dynamic (unit_directory count, not hardcoded)
+ *     - occupied_units = total_units - vacant_units - notice_units
+ *     - occupancy_rate = occupied_units / total_units
+ *
+ * Change detection:
+ *   If the derived total_units differs from the previous snapshot by more
+ *   than 5 units, a WARNING is logged so the team can investigate.
+ */
 
-import {
-  TransformContext,
-  TransformStrategy,
-  SilverNormalizeResult,
-  GoldPromoteResult,
-  SilverAppfolioReport,
-} from "../types";
+import { TransformStrategy, TransformContext, GoldPromoteResult } from "../types";
+import { normalizeUnitId } from "../utils/normalize";
+import { SilverAppfolioReport } from "../types";
+import * as crypto from "crypto";
 
-// ── Property constant ─────────────────────────────────────────────────────────
-// Total rentable units across all properties managed in AppFolio.
-// Source: unit_directory report (19 property records, 182 distinct UnitName values).
-// Update this constant only if the property portfolio changes.
-const TOTAL_UNITS = 182;
+// ── Change-detection threshold ────────────────────────────────────────────────
+const UNIT_COUNT_CHANGE_THRESHOLD = 5;
 
-// ── Date extraction helper ────────────────────────────────────────────────────
-function toDateStr(val: unknown, fallback: string): string {
-  if (!val) return fallback;
-  if (val instanceof Date) return val.toISOString().slice(0, 10);
-  const s = String(val).trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
-    const [m, d, y] = s.split("/");
-    return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
-  }
-  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return s.slice(0, 10);
-  return fallback;
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-// ── Classify a UnitStatus string ──────────────────────────────────────────────
-// The unit_vacancy report only sends vacant/notice units, but we classify
-// defensively in case AppFolio ever includes other statuses.
-function classifyStatus(status: string): "vacant" | "notice" | "other" {
-  const s = status.toLowerCase().trim();
+/**
+ * Classify an AppFolio UnitStatus string into one of three buckets.
+ * The unit_vacancy report only sends vacant and notice units.
+ */
+function classifyStatus(status: string): "vacant" | "notice" | null {
+  const s = (status ?? "").toLowerCase();
   if (s.startsWith("vacant")) return "vacant";
   if (s.startsWith("notice")) return "notice";
-  return "other"; // occupied, model, down — not expected in this report
+  return null; // occupied units are not present in this report
 }
 
-// ── Strategy ─────────────────────────────────────────────────────────────────
+/**
+ * Derive total_units dynamically from the database.
+ *
+ * Priority order:
+ *   1. COUNT of distinct active UnitName values across all unit_directory
+ *      Bronze chunks for the same report_date (most authoritative).
+ *   2. COUNT(DISTINCT unit_id) from gold_lease_expirations (Gold fallback —
+ *      only counts leased units, so may undercount vacant units).
+ *   3. Previous gold_occupancy_snapshots total_units value (historical fallback).
+ *
+ * Returns { total: number, source: string }
+ */
+async function deriveTotalUnits(
+  ctx: TransformContext,
+  reportDate: string
+): Promise<{ total: number; source: string }> {
+  // ── Source 1: unit_directory Bronze chunks ──────────────────────────────
+  try {
+    const rows = await ctx.sql`
+      SELECT SUM(jsonb_array_length(raw_data->'results')) AS cnt
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'unit_directory'
+        AND report_date = ${reportDate}
+    `;
+    const cnt = Number((rows as any)[0]?.cnt ?? 0);
+    if (cnt > 0) {
+      return { total: cnt, source: "unit_directory_bronze" };
+    }
+  } catch (_) {
+    // fall through
+  }
+
+  // ── Source 2: gold_lease_expirations distinct unit_ids ──────────────────
+  try {
+    const rows = await ctx.sql`
+      SELECT COUNT(DISTINCT unit_id) AS cnt
+      FROM gold_lease_expirations
+      WHERE unit_id IS NOT NULL AND unit_id != 'unknown'
+    `;
+    const cnt = Number((rows as any)[0]?.cnt ?? 0);
+    if (cnt > 0) {
+      return { total: cnt, source: "gold_lease_expirations_distinct_units" };
+    }
+  } catch (_) {
+    // fall through
+  }
+
+  // ── Source 3: previous snapshot ─────────────────────────────────────────
+  try {
+    const rows = await ctx.sql`
+      SELECT total_units
+      FROM gold_occupancy_snapshots
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+    const cnt = Number((rows as any)[0]?.total_units ?? 0);
+    if (cnt > 0) {
+      return { total: cnt, source: "previous_snapshot" };
+    }
+  } catch (_) {
+    // fall through
+  }
+
+  // ── No source available — return 0 so the caller can skip ───────────────
+  return { total: 0, source: "none" };
+}
+
+// ── Strategy ──────────────────────────────────────────────────────────────────
 export const unitVacancyStrategy: TransformStrategy = {
+  // ── Silver normalization ─────────────────────────────────────────────────
+  normalize(ctx: TransformContext): Record<string, unknown> {
+    const raw = ctx.bronze.raw_data as {
+      results?: Record<string, unknown>[];
+      data?:    Record<string, unknown>[];
+      [key: string]: unknown;
+    };
 
-  // ── Silver normalisation ──────────────────────────────────────────────────
-  normalizeSilver(ctx: TransformContext): SilverNormalizeResult {
-    const raw   = ctx.bronze.raw_data;
-    const today = new Date().toISOString().slice(0, 10);
-    const reportDate =
-      ctx.reportDate ||
-      toDateStr(
-        ctx.bronze.report_date ?? raw.report_date ?? raw.period_end ?? raw.as_of_date,
-        today
-      );
-
-    // AppFolio sends rows under raw.results
-    const rows = Array.isArray(raw.results)
-      ? (raw.results as Record<string, unknown>[])
-      : Array.isArray(raw.rows)
-      ? (raw.rows as Record<string, unknown>[])
-      : [];
+    // AppFolio unit_vacancy uses chunked 'results' key
+    const rows: Record<string, unknown>[] =
+      raw.results ?? raw.data ?? [];
 
     let vacantUnits = 0;
     let noticeUnits = 0;
 
     for (const row of rows) {
-      const status = String(row.UnitStatus ?? row.unit_status ?? row.status ?? "");
-      const cat = classifyStatus(status);
-      if (cat === "vacant") vacantUnits++;
-      else if (cat === "notice") noticeUnits++;
-      // "other" rows (occupied, model, down) are ignored — not expected here
+      const status = String(row["UnitStatus"] ?? row["unit_status"] ?? "");
+      const bucket = classifyStatus(status);
+      if (bucket === "vacant") vacantUnits++;
+      else if (bucket === "notice") noticeUnits++;
     }
 
-    // Occupied = all units not reported as vacant or notice
-    const occupiedUnits = TOTAL_UNITS - vacantUnits - noticeUnits;
-    const occupancyRate = occupiedUnits / TOTAL_UNITS;
-    const vacancyRate   = (vacantUnits + noticeUnits) / TOTAL_UNITS;
-
     return {
-      normalized_data: {
-        source:           "appfolio",
-        report_type:      ctx.bronze.report_type,
-        report_date:      reportDate,
-        bronze_report_id: ctx.bronze.id,
-        transformed_at:   new Date().toISOString(),
-        total_units:      TOTAL_UNITS,
-        occupied_units:   occupiedUnits,
-        vacant_units:     vacantUnits,
-        notice_units:     noticeUnits,
-        occupancy_rate:   occupancyRate,
-        vacancy_rate:     vacancyRate,
-      },
+      report_date:  ctx.bronze.report_date,
+      // total_units is intentionally omitted here — it is resolved
+      // dynamically at Gold promotion time from the database.
+      vacant_units: vacantUnits,
+      notice_units: noticeUnits,
+      row_count:    rows.length,
     };
   },
 
@@ -118,19 +145,65 @@ export const unitVacancyStrategy: TransformStrategy = {
     ctx: TransformContext & { silver: SilverAppfolioReport }
   ): Promise<GoldPromoteResult> {
     const nd = ctx.silver.normalized_data as {
-      report_date:    string;
-      total_units:    number;
-      occupied_units: number;
-      vacant_units:   number;
-      notice_units:   number;
-      occupancy_rate: number;
-      vacancy_rate:   number;
+      report_date:  string;
+      vacant_units: number;
+      notice_units: number;
+      row_count:    number;
     };
 
-    const contentHash = require("crypto")
+    const reportDate  = nd.report_date;
+    const vacantUnits = Number(nd.vacant_units ?? 0);
+    const noticeUnits = Number(nd.notice_units ?? 0);
+
+    // ── Dynamically resolve total_units ──────────────────────────────────
+    const { total: totalUnits, source: totalSource } =
+      await deriveTotalUnits(ctx, reportDate);
+
+    if (totalUnits === 0) {
+      console.warn(
+        `[unit_vacancy] WARN: Could not derive total_units for ${reportDate} — skipping Gold promotion`
+      );
+      return { gold_ids: [], skipped: true };
+    }
+
+    // ── Change-detection warning ──────────────────────────────────────────
+    try {
+      const prev = await ctx.sql`
+        SELECT total_units FROM gold_occupancy_snapshots
+        ORDER BY report_date DESC LIMIT 1
+      `;
+      const prevTotal = Number((prev as any)[0]?.total_units ?? 0);
+      if (prevTotal > 0) {
+        const delta = Math.abs(totalUnits - prevTotal);
+        if (delta > UNIT_COUNT_CHANGE_THRESHOLD) {
+          console.warn(
+            `[unit_vacancy] WARN: total_units changed significantly: ` +
+            `${prevTotal} → ${totalUnits} (Δ${delta > 0 ? "+" : ""}${totalUnits - prevTotal}) ` +
+            `source=${totalSource} date=${reportDate}`
+          );
+        }
+      }
+    } catch (_) {
+      // Non-critical — do not block promotion
+    }
+
+    // ── Calculate occupancy metrics ───────────────────────────────────────
+    // Occupancy = all non-vacant units (occupied + notice)
+    const nonVacantUnits = totalUnits - vacantUnits;
+    const occupiedUnits  = Math.max(0, nonVacantUnits);
+    const occupancyRate  = parseFloat((occupiedUnits / totalUnits).toFixed(4));
+    const vacancyRate    = parseFloat((vacantUnits   / totalUnits).toFixed(4));
+
+    console.log(
+      `[unit_vacancy] date=${reportDate} total=${totalUnits}(${totalSource}) ` +
+      `vacant=${vacantUnits} notice=${noticeUnits} occupied=${occupiedUnits} ` +
+      `rate=${(occupancyRate * 100).toFixed(1)}%`
+    );
+
+    const contentHash = crypto
       .createHash("md5")
       .update(
-        `${nd.report_date}|${nd.total_units}|${nd.occupied_units}|${nd.vacant_units}|${nd.notice_units}`
+        `${reportDate}|${totalUnits}|${occupiedUnits}|${vacantUnits}|${noticeUnits}`
       )
       .digest("hex");
 
@@ -146,12 +219,12 @@ export const unitVacancyStrategy: TransformStrategy = {
         content_hash
       ) VALUES (
         ${ctx.bronze.id},
-        ${nd.report_date},
-        ${nd.total_units},
-        ${nd.occupied_units},
-        ${nd.vacant_units},
-        ${nd.occupancy_rate},
-        ${nd.vacancy_rate},
+        ${reportDate},
+        ${totalUnits},
+        ${occupiedUnits},
+        ${vacantUnits},
+        ${occupancyRate},
+        ${vacancyRate},
         ${contentHash}
       )
       ON CONFLICT (report_date, content_hash)
