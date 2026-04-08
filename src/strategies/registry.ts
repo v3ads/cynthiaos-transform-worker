@@ -29,8 +29,20 @@ const TRANSFORM_STRATEGIES: Record<string, TransformStrategy> = {
   aged_receivables:    agedReceivablesStrategy,
   tenant_directory:    tenantDirectoryStrategy,
   income_statement:    incomeStatementStrategy,
-  occupancy_summary:   occupancySummaryStrategy,
-  move_in_move_out:    moveInMoveOutStrategy,
+
+  // ── Occupancy: legacy key preserved for historical Bronze records ─────────
+  // The AppFolio API uses 'unit_vacancy' as the canonical report type name.
+  // 'occupancy_summary' was the original (incorrect) name used during early
+  // development. Both keys map to the same strategy for backward compatibility.
+  occupancy_summary:   occupancySummaryStrategy,  // legacy — kept for historical records
+  unit_vacancy:        occupancySummaryStrategy,  // FIX: correct AppFolio report type name
+
+  // ── Turnover: legacy key preserved for historical Bronze records ──────────
+  // The AppFolio API uses 'unit_turn_detail' as the canonical report type name.
+  // 'move_in_move_out' was the original (incorrect) name used during early
+  // development. Both keys map to the same strategy for backward compatibility.
+  move_in_move_out:    moveInMoveOutStrategy,     // legacy — kept for historical records
+  unit_turn_detail:    moveInMoveOutStrategy,     // FIX: correct AppFolio report type name
 
   // ── Planned (add handlers here as they are implemented) ──────────────────
   // maintenance_request: maintenanceRequestStrategy,
