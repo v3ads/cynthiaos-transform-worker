@@ -83,25 +83,34 @@ export const agedReceivablesStrategy: TransformStrategy = {
 
   normalizeSilver(ctx: TransformContext): SilverNormalizeResult {
     const raw  = ctx.bronze.raw_data;
-    const rows = Array.isArray(raw.rows)
+    // Support both AppFolio native format (raw.results) and legacy format (raw.rows)
+    const rows = Array.isArray(raw.results)
+      ? (raw.results as Record<string, unknown>[])
+      : Array.isArray(raw.rows)
       ? (raw.rows as Record<string, unknown>[])
       : [];
     const summary = (raw.summary ?? {}) as Record<string, unknown>;
 
-    const normalizedRows = rows.map((r) => {
-      // Support multiple AppFolio field name variants
-      const rawName  = String(r.tenant ?? r.tenant_id ?? r.tenant_name ?? r.name ?? r.resident ?? "");
-      const rawUnit  = String(r.unit   ?? r.unit_id   ?? r.unit_number  ?? "");
+    // AppFolio aged_receivables_detail has one row per invoice line, not per tenant.
+    // Aggregate by tenant (PayerName + UnitName) before normalising.
+    const tenantMap = new Map<string, { rawName: string; rawUnit: string; b0_30: number; b31_60: number; b61_90: number; b90plus: number; }>();
+    for (const r of rows) {
+      // AppFolio PascalCase fields; also support legacy snake_case
+      const rawName = String(r.PayerName ?? r.tenant ?? r.tenant_id ?? r.tenant_name ?? r.name ?? r.resident ?? "");
+      const rawUnit = String(r.UnitName  ?? r.unit   ?? r.unit_id   ?? r.unit_number  ?? "");
+      const key = `${rawName}||${rawUnit}`;
+      const existing = tenantMap.get(key) ?? { rawName, rawUnit, b0_30: 0, b31_60: 0, b61_90: 0, b90plus: 0 };
+      existing.b0_30   += toNum(r["0To30"]   ?? r.bucket_0_30   ?? r["0_30"]   ?? r.current    ?? 0);
+      existing.b31_60  += toNum(r["30To60"]  ?? r.bucket_31_60  ?? r["31_60"]  ?? r.days_31_60 ?? 0);
+      existing.b61_90  += toNum(r["60To90"]  ?? r.bucket_61_90  ?? r["61_90"]  ?? r.days_61_90 ?? 0);
+      existing.b90plus += toNum(r["90Plus"]  ?? r.bucket_90_plus ?? r["90_plus"] ?? r.over_90  ?? 0);
+      tenantMap.set(key, existing);
+    }
+
+    const normalizedRows = Array.from(tenantMap.values()).map(({ rawName, rawUnit, b0_30, b31_60, b61_90, b90plus }) => {
       const tenantId = normalizeTenantId(rawName, rawUnit);
       const unitId   = normalizeUnitId(rawUnit);
-
-      const b0_30   = toNum(r.bucket_0_30   ?? r["0_30"]   ?? r.current    ?? r.current_balance    ?? 0);
-      const b31_60  = toNum(r.bucket_31_60  ?? r["31_60"]  ?? r.days_31_60 ?? r.balance_31_60      ?? 0);
-      const b61_90  = toNum(r.bucket_61_90  ?? r["61_90"]  ?? r.days_61_90 ?? r.balance_61_90      ?? 0);
-      const b90plus = toNum(r.bucket_90_plus ?? r["90_plus"] ?? r.over_90  ?? r.balance_over_90    ?? 0);
-
-      const totalBalance = toNum(r.total_balance ?? r.total ?? r.balance ?? 0)
-        || (b0_30 + b31_60 + b61_90 + b90plus);
+      const totalBalance = b0_30 + b31_60 + b61_90 + b90plus;
 
       return {
         tenant_id:      tenantId,

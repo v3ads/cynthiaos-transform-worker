@@ -162,6 +162,9 @@ export const moveInMoveOutStrategy: TransformStrategy = {
       const moveIns  = Array.isArray(raw.move_ins)  ? (raw.move_ins  as Record<string, unknown>[]) : [];
       const moveOuts = Array.isArray(raw.move_outs) ? (raw.move_outs as Record<string, unknown>[]) : [];
       events = extractFromSeparateArrays(moveIns, moveOuts);
+    } else if (Array.isArray(raw.results)) {
+      // AppFolio native format
+      events = extractFromRows(raw.results as Record<string, unknown>[]);
     } else if (Array.isArray(raw.rows)) {
       // Shape 1: flat rows array
       events = extractFromRows(raw.rows as Record<string, unknown>[]);

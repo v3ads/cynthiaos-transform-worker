@@ -18,10 +18,19 @@ export const rentRollStrategy: TransformStrategy = {
   // ── Silver normalisation ──────────────────────────────────────────────────
   normalizeSilver(ctx: TransformContext): SilverNormalizeResult {
     const raw = ctx.bronze.raw_data;
-    const rows = Array.isArray(raw.rows)
+    // Support both AppFolio native format (raw.results) and legacy format (raw.rows)
+    const rows = Array.isArray(raw.results)
+      ? (raw.results as Record<string, unknown>[])
+      : Array.isArray(raw.rows)
       ? (raw.rows as Record<string, unknown>[])
       : [];
     const summary = (raw.summary ?? {}) as Record<string, unknown>;
+
+    const toNum = (v: unknown) => {
+      if (typeof v === "number") return v;
+      if (typeof v === "string") { const n = parseFloat(v.replace(/[^0-9.-]/g, "")); return isNaN(n) ? 0 : n; }
+      return 0;
+    };
 
     const normalized_data: Record<string, unknown> = {
       source: "appfolio",
@@ -31,23 +40,20 @@ export const rentRollStrategy: TransformStrategy = {
       transformed_at: new Date().toISOString(),
       row_count: rows.length,
       rows: rows.map((r) => ({
-        property_id: r.property_id ?? null,
-        unit: r.unit ?? null,
-        tenant: r.tenant ?? null,
-        rent: typeof r.rent === "number" ? r.rent : null,
-        status: r.status ?? null,
-        // Preserve lease date fields if present in the source payload
-        lease_start_date: r.lease_start_date ?? r.lease_start ?? null,
-        lease_end_date: r.lease_end_date ?? r.lease_end ?? null,
+        // AppFolio PascalCase fields; also support legacy snake_case
+        property_id:     r.PropertyId    ?? r.property_id    ?? null,
+        unit:            r.Unit          ?? r.unit           ?? null,
+        tenant:          r.Tenant        ?? r.tenant         ?? null,
+        rent:            r.Rent != null  ? toNum(r.Rent)     : typeof r.rent === "number" ? r.rent : null,
+        status:          r.Status        ?? r.status         ?? null,
+        lease_start_date: r.LeaseFrom    ?? r.MoveIn         ?? r.lease_start_date ?? r.lease_start ?? null,
+        lease_end_date:   r.LeaseTo      ?? r.MoveOut        ?? r.lease_end_date   ?? r.lease_end   ?? null,
       })),
       summary: {
         total_units: summary.total_units ?? rows.length,
         total_rent:
           summary.total_rent ??
-          rows.reduce(
-            (acc, r) => acc + (typeof r.rent === "number" ? r.rent : 0),
-            0
-          ),
+          rows.reduce((acc, r) => acc + toNum(r.Rent ?? r.rent ?? 0), 0),
         occupancy_rate: summary.occupancy_rate ?? null,
       },
     };

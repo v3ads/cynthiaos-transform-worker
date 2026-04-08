@@ -42,30 +42,41 @@ export const delinquencyStrategy: TransformStrategy = {
   // ── Silver normalisation ──────────────────────────────────────────────────
   normalizeSilver(ctx: TransformContext): SilverNormalizeResult {
     const raw = ctx.bronze.raw_data;
-    const rows = Array.isArray(raw.rows)
+    // Support both AppFolio native format (raw.results) and legacy format (raw.rows)
+    const rows = Array.isArray(raw.results)
+      ? (raw.results as Record<string, unknown>[])
+      : Array.isArray(raw.rows)
       ? (raw.rows as Record<string, unknown>[])
       : [];
     const summary = (raw.summary ?? {}) as Record<string, unknown>;
 
     const normalizedRows = rows.map((r) => {
-      const daysOverdue =
-        typeof r.days_overdue === "number" ? r.days_overdue
+      // AppFolio delinquency: use 30Plus as days_overdue proxy (amount 30+ days past due)
+      // Days overdue is not directly in the report; derive from aging buckets
+      const thirtyPlus  = parseFloat(String(r["30Plus"]  ?? r.days_overdue ?? r.days_past_due ?? "0").replace(/,/g, "")) || 0;
+      const sixtyPlus   = parseFloat(String(r["60Plus"]  ?? "0").replace(/,/g, "")) || 0;
+      const ninetyPlus  = parseFloat(String(r["90Plus"]  ?? "0").replace(/,/g, "")) || 0;
+      // Derive days_overdue from aging buckets: 90+ days = 90, 60+ = 60, 30+ = 30, else null
+      const daysOverdue: number | null =
+        ninetyPlus > 0 ? 90
+        : sixtyPlus > 0 ? 60
+        : thirtyPlus > 0 ? 30
+        : typeof r.days_overdue === "number" ? r.days_overdue
         : typeof r.days_past_due === "number" ? r.days_past_due
         : null;
 
       const balanceDue =
-        typeof r.balance_due === "number" ? r.balance_due
-        : typeof r.amount_owed === "number" ? r.amount_owed
-        : typeof r.balance === "number" ? r.balance
-        : 0;
+        parseFloat(String(r.AmountReceivable ?? r.balance_due ?? r.amount_owed ?? r.balance ?? "0").replace(/,/g, "")) || 0;
 
       const lastPaymentDate =
-        typeof r.last_payment_date === "string" ? r.last_payment_date
+        typeof r.LastPayment === "string" && r.LastPayment ? r.LastPayment
+        : typeof r.last_payment_date === "string" ? r.last_payment_date
         : typeof r.last_paid === "string" ? r.last_paid
         : null;
 
-      const rawName = String(r.tenant ?? r.tenant_id ?? r.tenant_name ?? r.name ?? r.resident ?? "");
-      const rawUnit = String(r.unit   ?? r.unit_id   ?? r.unit_number ?? "");
+      // AppFolio delinquency: Name = "LastName, FirstName", Unit = unit number
+      const rawName = String(r.Name ?? r.tenant ?? r.tenant_id ?? r.tenant_name ?? r.name ?? r.resident ?? "");
+      const rawUnit = String(r.Unit ?? r.unit   ?? r.unit_id   ?? r.unit_number ?? "");
       return {
         tenant_id: normalizeTenantId(rawName, rawUnit),
         unit_id:   normalizeUnitId(rawUnit),

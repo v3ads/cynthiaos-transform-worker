@@ -147,7 +147,12 @@ export const incomeStatementStrategy: TransformStrategy = {
     let operatingExpenses: number;
     let noi: number;
 
-    const rows = Array.isArray(raw.rows) ? (raw.rows as Record<string, unknown>[]) : [];
+    // Support both AppFolio native format (raw.results) and legacy format (raw.rows)
+    const rows = Array.isArray(raw.results)
+      ? (raw.results as Record<string, unknown>[])
+      : Array.isArray(raw.rows)
+      ? (raw.rows as Record<string, unknown>[])
+      : [];
 
     if (rows.length > 0) {
       // Shape 2: line-item rows

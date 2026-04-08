@@ -89,28 +89,52 @@ export const tenantDirectoryStrategy: TransformStrategy = {
 
   normalizeSilver(ctx: TransformContext): SilverNormalizeResult {
     const raw  = ctx.bronze.raw_data;
-    const rows = Array.isArray(raw.rows)
+    // Support both AppFolio native format (raw.results) and legacy format (raw.rows)
+    const rows = Array.isArray(raw.results)
+      ? (raw.results as Record<string, unknown>[])
+      : Array.isArray(raw.rows)
       ? (raw.rows as Record<string, unknown>[])
       : [];
     const summary = (raw.summary ?? {}) as Record<string, unknown>;
 
     const normalizedRows = rows.map((r) => {
-      const fullName = String(
-        r.full_name ?? r.name ?? r.tenant_name ?? r.tenant ?? "unknown"
+      // AppFolio uses PascalCase; also support legacy snake_case
+      const firstName = String(r.FirstName ?? r.first_name ?? "").trim();
+      const lastName  = String(r.LastName  ?? r.last_name  ?? "").trim();
+      const fullName  = String(
+        r.Tenant ?? r.full_name ?? r.name ?? r.tenant_name ??
+        (firstName && lastName ? `${firstName} ${lastName}` : firstName || lastName) ??
+        "unknown"
       ).trim();
       const unitId = String(
-        r.unit ?? r.unit_id ?? r.unit_number ?? "unknown"
+        r.Unit ?? r.unit ?? r.unit_id ?? r.unit_number ?? "unknown"
       ).trim();
+      // AppFolio Emails is an array of objects; extract first email
+      let email: string | null = null;
+      if (Array.isArray(r.Emails) && (r.Emails as any[]).length > 0) {
+        const firstEmail = (r.Emails as any[])[0];
+        email = cleanEmail(firstEmail?.EmailAddress ?? firstEmail?.email ?? firstEmail);
+      } else {
+        email = cleanEmail(r.email ?? r.email_address ?? r.contact_email ?? r.PrimaryTenantEmail);
+      }
+      // AppFolio PhoneNumbers is an array of objects; extract first phone
+      let phone: string | null = null;
+      if (Array.isArray(r.PhoneNumbers) && (r.PhoneNumbers as any[]).length > 0) {
+        const firstPhone = (r.PhoneNumbers as any[])[0];
+        phone = cleanPhone(firstPhone?.PhoneNumber ?? firstPhone?.phone ?? firstPhone);
+      } else {
+        phone = cleanPhone(r.phone ?? r.phone_number ?? r.mobile ?? r.cell);
+      }
 
       return {
         tenant_id:        normalizeTenantId(fullName, unitId),
         full_name:        fullName,
         unit_id:          unitId,
-        email:            cleanEmail(r.email ?? r.email_address ?? r.contact_email),
-        phone:            cleanPhone(r.phone ?? r.phone_number ?? r.mobile ?? r.cell),
-        lease_start_date: toDateStr(r.lease_start_date ?? r.move_in_date ?? r.start_date),
-        lease_end_date:   toDateStr(r.lease_end_date   ?? r.move_out_date ?? r.end_date),
-        lease_status:     normalizeLeaseStatus(r.lease_status ?? r.status ?? r.tenancy_status),
+        email,
+        phone,
+        lease_start_date: toDateStr(r.LeaseFrom ?? r.MoveIn ?? r.lease_start_date ?? r.move_in_date ?? r.start_date),
+        lease_end_date:   toDateStr(r.LeaseTo   ?? r.MoveOut ?? r.lease_end_date   ?? r.move_out_date ?? r.end_date),
+        lease_status:     normalizeLeaseStatus(r.Status ?? r.TenantStatus ?? r.lease_status ?? r.status ?? r.tenancy_status),
       };
     });
 
