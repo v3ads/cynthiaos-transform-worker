@@ -9,6 +9,14 @@ import {
   TransformContext,
 } from "./types";
 import { getStrategy, isSupported, getSupportedTypes } from "./strategies/registry";
+import {
+  validateSilver,
+  runIntegrityChecks,
+  ensurePipelineLogsTable,
+  logSilverValidation,
+  logGoldPromotion,
+  logIntegrityReport,
+} from "./validation";
 
 const app = express();
 const PORT = parseInt(process.env.PORT ?? "3002", 10);
@@ -63,6 +71,11 @@ async function checkDatabaseConnectivity(): Promise<void> {
     dbTimestamp = result[0].now.toISOString();
     dbConnected = true;
     console.log(`[${SERVICE_NAME}] DB connectivity verified — SELECT NOW() = ${dbTimestamp}`);
+
+    // Ensure pipeline_logs table exists on every startup
+    await ensurePipelineLogsTable(sql);
+    console.log(`[${SERVICE_NAME}] pipeline_logs table verified`);
+
     await sql.end();
   } catch (err) {
     console.error(`[${SERVICE_NAME}] DB connectivity check FAILED:`, err);
@@ -98,9 +111,6 @@ function deriveReportDate(bronze: BronzeAppfolioReport): string | null {
 }
 
 // ── Silver transform (strategy-driven) ───────────────────────────────────────
-//
-// Selects the appropriate TransformStrategy for the Bronze record's report_type,
-// delegates normalisation, and writes the Silver record + pipeline_metadata.
 
 async function transformBronzeReport(
   sql: postgres.Sql,
@@ -135,6 +145,20 @@ async function transformBronzeReport(
   const ctx: TransformContext = { sql, bronze, reportDate };
   const { normalized_data } = strategy.normalizeSilver(ctx);
 
+  // ── VALIDATION HOOK: Silver phase ─────────────────────────────────────────
+  // Runs after normalization, before DB write. Non-blocking — warnings only.
+  const validationResult = validateSilver(bronze.report_type, normalized_data);
+  if (validationResult.anomaly_count > 0) {
+    console.warn(
+      `[${SERVICE_NAME}] SILVER_VALIDATION WARN — type=${bronze.report_type} anomalies=${validationResult.anomaly_count}:`,
+      validationResult.anomalies.map((a) => `${a.field}: ${a.issue}`).join(" | ")
+    );
+  }
+  // Log to pipeline_logs (fire-and-forget — must not block Silver write)
+  logSilverValidation(sql, bronze.id, validationResult).catch((err) => {
+    console.error(`[${SERVICE_NAME}] logSilverValidation failed (non-fatal):`, err);
+  });
+
   const reportDateStr = reportDate ?? new Date().toISOString().slice(0, 10);
 
   const silverRows = await sql<SilverAppfolioReport[]>`
@@ -159,11 +183,6 @@ async function transformBronzeReport(
 }
 
 // ── Gold promotion (strategy-driven) ─────────────────────────────────────────
-//
-// Finds the oldest Silver record that has NOT yet been promoted to Gold,
-// resolves the strategy for its report_type, and delegates Gold promotion.
-// Unlike the old implementation, there is NO hardcoded report_type filter —
-// every report type is eligible; the strategy decides what to do.
 
 async function triggerGold(): Promise<void> {
   const port = process.env.PORT ?? "3002";
@@ -306,21 +325,17 @@ app.post("/transform/run", async (_req: Request, res: Response) => {
 
 // ── POST /gold/run ─────────────────────────────────────────────────────────
 //
-// Finds the next eligible Silver record (any report_type — no hardcoded filter),
-// resolves the strategy for its report_type, and delegates Gold promotion.
-// Unsupported report types are skipped gracefully (no crash, no data corruption).
+// Finds the next eligible Silver record (supported report types only),
+// resolves the strategy, delegates Gold promotion, logs the result,
+// and runs integrity checks after every successful promotion.
 app.post("/gold/run", async (_req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
 
-    // Find the oldest Silver record that has NOT yet been promoted to Gold.
-    // Only process report types with registered Gold strategies — unsupported types
-    // are marked as skipped immediately via a bulk UPDATE rather than one-by-one.
     const supportedTypes = getSupportedTypes();
 
     // Bulk-skip all unsupported Silver records that are still pending Gold promotion
-    // so they never block the queue again.
     await sql`
       INSERT INTO pipeline_metadata (bronze_report_id, stage, status)
       SELECT s.bronze_report_id, 'gold', 'skipped'
@@ -359,10 +374,26 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
 
     if (candidates.length === 0) {
       console.log(`[${SERVICE_NAME}] POST /gold/run — no eligible silver records found`);
+
+      // ── INTEGRITY CHECK: runs even when queue is empty ──────────────────
+      // This catches regressions that happened outside the normal pipeline
+      // (e.g., manual DB edits, failed re-promotions from a previous run).
+      const integrityReport = await runIntegrityChecks(sql);
+      await logIntegrityReport(sql, integrityReport).catch(() => {});
+
+      if (!integrityReport.all_passed) {
+        const failedChecks = integrityReport.checks.filter((c) => !c.passed);
+        console.warn(
+          `[${SERVICE_NAME}] INTEGRITY CHECK FAILED — ${failedChecks.length} issue(s):`,
+          failedChecks.map((c) => `${c.table}: ${c.detail}`).join(" | ")
+        );
+      }
+
       res.status(200).json({
         success: true,
         processed: false,
         reason: "No Silver records pending Gold promotion",
+        integrity: integrityReport,
       });
       return;
     }
@@ -395,10 +426,40 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
     const ctx = { sql, bronze, silver, reportDate };
     const result = await strategy.promoteGold(ctx);
 
+    // ── VALIDATION HOOK: Gold phase ───────────────────────────────────────
+    // Log the Gold promotion result (non-blocking)
+    logGoldPromotion(
+      sql,
+      bronze_report_id,
+      report_type,
+      result.gold_ids.length,
+      result.skipped,
+      result.skip_reason
+    ).catch((err) => {
+      console.error(`[${SERVICE_NAME}] logGoldPromotion failed (non-fatal):`, err);
+    });
+
     // Record pipeline_metadata stage='gold'
     const goldStatus = result.skipped ? "skipped" : "processed";
     const meta = await insertPipelineMetadata(sql, bronze_report_id, "gold", goldStatus);
     console.log(`[${SERVICE_NAME}] POST /gold/run — pipeline_metadata id=${meta.id} stage=gold status=${goldStatus}`);
+
+    // ── INTEGRITY CHECK: runs after every successful Gold promotion ───────
+    // Fire-and-forget — must not block the response
+    runIntegrityChecks(sql)
+      .then((integrityReport) => {
+        logIntegrityReport(sql!, integrityReport).catch(() => {});
+        if (!integrityReport.all_passed) {
+          const failedChecks = integrityReport.checks.filter((c) => !c.passed);
+          console.warn(
+            `[${SERVICE_NAME}] POST-GOLD INTEGRITY WARN — ${failedChecks.length} issue(s):`,
+            failedChecks.map((c) => `${c.table}: ${c.detail}`).join(" | ")
+          );
+        }
+      })
+      .catch((err) => {
+        console.error(`[${SERVICE_NAME}] runIntegrityChecks failed (non-fatal):`, err);
+      });
 
     res.status(200).json({
       success: true,
@@ -428,8 +489,58 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
   }
 });
 
+// ── GET /validation/logs ──────────────────────────────────────────────────────
+// Returns the most recent pipeline log entries for monitoring dashboards.
+app.get("/validation/logs", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const logs = await sql<{
+      id: string;
+      logged_at: Date;
+      stage: string;
+      report_type: string;
+      row_count: number;
+      anomaly_count: number;
+      validation_status: string;
+      detail: Record<string, unknown>;
+    }[]>`
+      SELECT id, logged_at, stage, report_type, row_count, anomaly_count, validation_status, detail
+      FROM pipeline_logs
+      ORDER BY logged_at DESC
+      LIMIT 100
+    `;
+    res.status(200).json({ success: true, count: logs.length, logs });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
+// ── GET /validation/integrity ─────────────────────────────────────────────────
+// Runs an on-demand integrity check and returns the full report.
+app.get("/validation/integrity", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const report = await runIntegrityChecks(sql);
+    await logIntegrityReport(sql, report).catch(() => {});
+    res.status(report.all_passed ? 200 : 207).json({
+      success: true,
+      all_passed: report.all_passed,
+      report,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── GET /strategies ───────────────────────────────────────────────────────────
-// Diagnostic endpoint: returns the list of registered report types.
 app.get("/strategies", (_req: Request, res: Response) => {
   res.status(200).json({
     success: true,
@@ -448,6 +559,12 @@ app.get("/health", (_req: Request, res: Response) => {
       verified_at: dbTimestamp,
     },
     supported_report_types: getSupportedTypes(),
+    validation: {
+      silver_validator: "active",
+      gold_guard: "active",
+      integrity_checker: "active",
+      pipeline_logger: "active",
+    },
   });
 });
 
@@ -460,6 +577,7 @@ app.use((_req: Request, res: Response) => {
 app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[${SERVICE_NAME}] listening on port ${PORT}`);
   console.log(`[${SERVICE_NAME}] registered strategies: ${getSupportedTypes().join(", ")}`);
+  console.log(`[${SERVICE_NAME}] validation layer: silverValidator + goldGuard + integrityChecker + pipelineLogger`);
   await checkDatabaseConnectivity();
 });
 
