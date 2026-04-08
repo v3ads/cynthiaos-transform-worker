@@ -85,20 +85,22 @@ export const rentRollStrategy: TransformStrategy = {
     const goldIds: string[] = [];
 
     for (const row of rows) {
-      const rawName  = String(row.tenant ?? row.tenant_id ?? row.name ?? row.resident ?? "");
+      // FIX: Use tenant name ONLY for tenant_id — never append unit number.
+      // This ensures the tenant_id matches gold_tenants for cross-table JOINs.
+      const rawName  = String(row.tenant ?? row.tenant_id ?? row.tenant_name ?? row.name ?? row.resident ?? "");
       const rawUnit  = String(row.unit   ?? row.unit_id   ?? "");
-      const tenantId = normalizeTenantId(rawName, rawUnit);
+      const tenantId = normalizeTenantId(rawName); // unit intentionally omitted
       const unitId   = normalizeUnitId(rawUnit);
 
-      // Derive lease dates: prefer explicit fields, fall back to report_date
+      // Derive lease dates: Silver stores lease_start_date and lease_end_date
       const leaseStart: string | null =
-        typeof row.lease_start_date === "string" ? row.lease_start_date
-        : typeof row.lease_start === "string"    ? row.lease_start
+        typeof row.lease_start_date === "string" && row.lease_start_date ? row.lease_start_date
+        : typeof row.lease_start === "string"    && row.lease_start      ? row.lease_start
         : reportDate ?? null;
 
       const leaseEnd: string | null =
-        typeof row.lease_end_date === "string" ? row.lease_end_date
-        : typeof row.lease_end === "string"    ? row.lease_end
+        typeof row.lease_end_date === "string" && row.lease_end_date ? row.lease_end_date
+        : typeof row.lease_end === "string"    && row.lease_end      ? row.lease_end
         : (() => {
             if (!reportDate) return null;
             const d = new Date(reportDate);
@@ -115,6 +117,8 @@ export const rentRollStrategy: TransformStrategy = {
         );
       }
 
+      // Use UPSERT so re-running Gold promotion corrects existing records
+      // that have the wrong tenant_id (with unit suffix from the old normalize logic)
       const goldRows = await sql<GoldLeaseExpiration[]>`
         INSERT INTO gold_lease_expirations
           (bronze_report_id, tenant_id, unit_id, lease_start_date, lease_end_date, days_until_expiration, created_at)
@@ -127,7 +131,11 @@ export const rentRollStrategy: TransformStrategy = {
           ${daysUntilExpiration},
           NOW()
         )
-        ON CONFLICT (bronze_report_id, tenant_id, unit_id) DO NOTHING
+        ON CONFLICT (bronze_report_id, tenant_id, unit_id)
+        DO UPDATE SET
+          lease_start_date       = EXCLUDED.lease_start_date,
+          lease_end_date         = EXCLUDED.lease_end_date,
+          days_until_expiration  = EXCLUDED.days_until_expiration
         RETURNING *
       `;
 

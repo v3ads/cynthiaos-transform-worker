@@ -75,9 +75,16 @@ function deriveProfitMargin(noi: number, totalIncome: number): number | null {
 
 // ── Extract summary from rows array (line-item format) ────────────────────────
 //
-// AppFolio sometimes exports income statements as a list of line items, e.g.:
-//   [{ category: "Rental Income", amount: 45000 }, ...]
-// This function aggregates those into the summary fields we need.
+// AppFolio exports income statements as a list of account line items:
+//   [{ AccountName: "Rent", AccountNumber: "4530", MonthToDate: "238,147.00",
+//      YearToDate: "1,015,600.32", ... }, ...]
+//
+// Income accounts: AccountNumber 4xxx (positive = income)
+// Expense accounts: AccountNumber 6xxx (positive = expense)
+// Summary rows: AccountName starts with "Total" (no AccountNumber)
+//
+// FIX (2026-04-08): Added AppFolio PascalCase field support.
+// Uses MonthToDate as the primary amount (current period).
 
 function extractFromRows(rows: Record<string, unknown>[]): {
   totalIncome: number;
@@ -90,32 +97,76 @@ function extractFromRows(rows: Record<string, unknown>[]): {
   let rentalIncome = 0;
   let otherIncome = 0;
   let totalExpenses = 0;
-  let operatingExpenses = 0;
+  let totalIncomeFromSummary = 0;
+  let totalExpenseFromSummary = 0;
+  let hasSummaryRows = false;
 
   for (const row of rows) {
-    const cat = String(row.category ?? row.account ?? row.line_item ?? row.description ?? "").toLowerCase();
-    const amt = toNum(row.amount ?? row.value ?? row.total ?? 0);
+    // AppFolio PascalCase; also support legacy snake_case
+    const accountName   = String(row.AccountName   ?? row.category ?? row.account ?? row.line_item ?? row.description ?? "");
+    const accountNumber = String(row.AccountNumber ?? row.account_number ?? "");
+    // Use MonthToDate as the primary amount; fall back to legacy field names
+    const amt = toNum(
+      row.MonthToDate ?? row.month_to_date ?? row.amount ?? row.value ?? row.total ?? 0
+    );
 
-    if (cat.includes("rental") || cat.includes("rent income") || cat.includes("base rent")) {
-      rentalIncome += amt;
-    } else if (cat.includes("income") || cat.includes("revenue")) {
-      otherIncome += amt;
-    } else if (cat.includes("operating") && cat.includes("expense")) {
-      operatingExpenses += amt;
-    } else if (cat.includes("expense") || cat.includes("cost")) {
-      totalExpenses += amt;
+    const nameLower = accountName.toLowerCase();
+
+    // Summary rows (no account number, name starts with "Total")
+    if (!accountNumber && nameLower.startsWith("total income")) {
+      totalIncomeFromSummary = amt;
+      hasSummaryRows = true;
+      continue;
+    }
+    if (!accountNumber && nameLower.startsWith("total expense")) {
+      totalExpenseFromSummary = Math.abs(amt);
+      hasSummaryRows = true;
+      continue;
+    }
+    if (!accountNumber) continue; // skip other summary rows
+
+    const acctNum = parseInt(accountNumber, 10);
+
+    // Income accounts: 4000–4999 (AppFolio convention)
+    if (acctNum >= 4000 && acctNum < 5000) {
+      const absAmt = Math.abs(amt); // some income rows are negative (concessions, prepaid)
+      // Account 4530 = Rent (primary rental income)
+      if (acctNum === 4530 || nameLower.includes("rent") && !nameLower.includes("expense")) {
+        rentalIncome += absAmt;
+      } else {
+        otherIncome += absAmt;
+      }
+    }
+    // Expense accounts: 6000–6999 (AppFolio convention)
+    else if (acctNum >= 6000 && acctNum < 7000) {
+      totalExpenses += Math.abs(amt);
     }
   }
 
-  // If operating_expenses not broken out, treat all expenses as operating
-  if (operatingExpenses === 0) operatingExpenses = totalExpenses;
-  // Ensure total_expenses >= operating_expenses
-  if (totalExpenses < operatingExpenses) totalExpenses = operatingExpenses;
+  // Prefer the "Total Income" / "Total Expense" summary rows if present
+  const finalTotalIncome   = hasSummaryRows && totalIncomeFromSummary > 0
+    ? totalIncomeFromSummary
+    : rentalIncome + otherIncome;
+  const finalTotalExpenses = hasSummaryRows && totalExpenseFromSummary > 0
+    ? totalExpenseFromSummary
+    : totalExpenses;
 
-  const totalIncome = rentalIncome + otherIncome;
-  const noi = totalIncome - totalExpenses;
+  // If we used summary rows, back-calculate rental vs other income split
+  if (hasSummaryRows && totalIncomeFromSummary > 0 && rentalIncome === 0) {
+    rentalIncome = finalTotalIncome;
+  }
 
-  return { totalIncome, rentalIncome, otherIncome, totalExpenses, operatingExpenses, noi };
+  const operatingExpenses = finalTotalExpenses; // all AppFolio expenses are operating
+  const noi = finalTotalIncome - finalTotalExpenses;
+
+  return {
+    totalIncome:       finalTotalIncome,
+    rentalIncome,
+    otherIncome,
+    totalExpenses:     finalTotalExpenses,
+    operatingExpenses,
+    noi,
+  };
 }
 
 // ── Strategy ─────────────────────────────────────────────────────────────────
@@ -253,7 +304,16 @@ export const incomeStatementStrategy: TransformStrategy = {
         ${contentHash},
         NOW()
       )
-      ON CONFLICT (report_date, content_hash) DO NOTHING
+      ON CONFLICT (report_date, content_hash)
+      DO UPDATE SET
+        bronze_report_id      = EXCLUDED.bronze_report_id,
+        total_income          = EXCLUDED.total_income,
+        rental_income         = EXCLUDED.rental_income,
+        other_income          = EXCLUDED.other_income,
+        total_expenses        = EXCLUDED.total_expenses,
+        operating_expenses    = EXCLUDED.operating_expenses,
+        net_operating_income  = EXCLUDED.net_operating_income,
+        profit_margin         = EXCLUDED.profit_margin
       RETURNING *
     `;
 

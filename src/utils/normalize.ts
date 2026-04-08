@@ -6,26 +6,33 @@
  */
 
 /**
- * Derive a stable, canonical tenant_id from a raw name and unit identifier.
+ * Derive a stable, canonical tenant_id from a raw name string.
+ *
+ * IMPORTANT: tenant_id is derived from the tenant NAME ONLY — never from
+ * the unit number. The unit is stored separately in the `unit_id` column.
+ * This ensures consistent tenant_id values across all Gold tables
+ * (gold_tenants, gold_lease_expirations, gold_delinquency_records,
+ *  gold_aged_receivables) so cross-table JOINs work correctly.
  *
  * Algorithm:
- *   1. Trim whitespace from both inputs.
- *   2. Concatenate as `{name}_{unit}`.
- *   3. Lowercase the entire string.
- *   4. Replace any run of non-alphanumeric characters with a single underscore.
- *   5. Strip leading/trailing underscores.
+ *   1. Trim whitespace from the name.
+ *   2. Lowercase the entire string.
+ *   3. Replace any run of non-alphanumeric characters with a single underscore.
+ *   4. Strip leading/trailing underscores.
+ *
+ * The second `_unit` parameter is accepted but IGNORED — it exists only
+ * for backward compatibility with call sites that previously passed the unit.
  *
  * Examples:
- *   normalizeTenantId("Maria Santos", "101")  → "maria_santos_101"
- *   normalizeTenantId("  Carlos Rivera ", "202A") → "carlos_rivera_202a"
- *   normalizeTenantId("Maria Santos", "")     → "maria_santos"
+ *   normalizeTenantId("Maria Santos", "101")  → "maria_santos"
+ *   normalizeTenantId("  Carlos Rivera ", "202A") → "carlos_rivera"
+ *   normalizeTenantId("PICINICH, ALEC", "")   → "picinich_alec"
+ *   normalizeTenantId("Jose Feliu", "103")    → "jose_feliu"
  */
-export function normalizeTenantId(name: unknown, unit: unknown): string {
+export function normalizeTenantId(name: unknown, _unit?: unknown): string {
   const n = String(name ?? "").trim();
-  const u = String(unit ?? "").trim();
-  const raw = u ? `${n}_${u}` : n;
-  if (!raw) return "unknown";
-  return raw
+  if (!n) return "unknown";
+  return n
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "");

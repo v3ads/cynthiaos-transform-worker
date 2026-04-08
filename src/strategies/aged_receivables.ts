@@ -7,6 +7,11 @@
 // Gold:   promotes each row into gold_aged_receivables with derived fields:
 //         dominant_bucket — the aging bucket with the highest dollar amount
 //         risk_score      — weighted sum: 0-30→1x, 31-60→2x, 61-90→3x, 90+→5x
+//
+// FIX (2026-04-08): Gold promotion now reads `unit_id ?? unit` to handle
+//   legacy Silver records that stored the unit number under the key `unit`.
+//   Also switched ON CONFLICT to DO UPDATE so re-running Gold promotion
+//   corrects existing records with unit_id='unknown'.
 
 import {
   TransformContext,
@@ -171,8 +176,12 @@ export const agedReceivablesStrategy: TransformStrategy = {
     const goldIds: string[] = [];
 
     for (const row of rows) {
-      const tenantId      = String(row.tenant_id      ?? "unknown");
-      const unitId        = String(row.unit_id        ?? "unknown");
+      const tenantId = String(row.tenant_id ?? "unknown");
+
+      // FIX: Silver may store unit as `unit_id` (new) or `unit` (legacy Silver records)
+      const rawUnit  = String(row.unit_id ?? row.unit ?? "unknown");
+      const unitId   = rawUnit === "unknown" ? "unknown" : normalizeUnitId(rawUnit);
+
       const totalBalance  = toNum(row.total_balance);
       const b0_30         = toNum(row.bucket_0_30);
       const b31_60        = toNum(row.bucket_31_60);
@@ -203,7 +212,16 @@ export const agedReceivablesStrategy: TransformStrategy = {
           ${riskScore},
           NOW()
         )
-        ON CONFLICT (bronze_report_id, tenant_id, unit_id) DO NOTHING
+        ON CONFLICT (bronze_report_id, tenant_id, unit_id)
+        DO UPDATE SET
+          unit_id         = EXCLUDED.unit_id,
+          total_balance   = EXCLUDED.total_balance,
+          bucket_0_30     = EXCLUDED.bucket_0_30,
+          bucket_31_60    = EXCLUDED.bucket_31_60,
+          bucket_61_90    = EXCLUDED.bucket_61_90,
+          bucket_90_plus  = EXCLUDED.bucket_90_plus,
+          dominant_bucket = EXCLUDED.dominant_bucket,
+          risk_score      = EXCLUDED.risk_score
         RETURNING *
       `;
 

@@ -16,9 +16,12 @@ import { delinquencyStrategy } from "./delinquency";
 import { agedReceivablesStrategy } from "./aged_receivables";
 import { tenantDirectoryStrategy } from "./tenant_directory";
 import { incomeStatementStrategy } from "./income_statement";
-import { occupancySummaryStrategy } from "./occupancy_summary";
-import { moveInMoveOutStrategy } from "./move_in_move_out";
-import { unsupportedStrategy } from "./unsupported";
+import { unitVacancyStrategy }       from "./unit_vacancy";
+import { unitTurnDetailStrategy }    from "./unit_turn_detail";
+// Legacy strategies kept for backward compatibility with historical Bronze records
+import { occupancySummaryStrategy }  from "./occupancy_summary";
+import { moveInMoveOutStrategy }     from "./move_in_move_out";
+import { unsupportedStrategy }       from "./unsupported";
 
 // ── Registry ──────────────────────────────────────────────────────────────────
 
@@ -30,19 +33,13 @@ const TRANSFORM_STRATEGIES: Record<string, TransformStrategy> = {
   tenant_directory:    tenantDirectoryStrategy,
   income_statement:    incomeStatementStrategy,
 
-  // ── Occupancy: legacy key preserved for historical Bronze records ─────────
-  // The AppFolio API uses 'unit_vacancy' as the canonical report type name.
-  // 'occupancy_summary' was the original (incorrect) name used during early
-  // development. Both keys map to the same strategy for backward compatibility.
-  occupancy_summary:   occupancySummaryStrategy,  // legacy — kept for historical records
-  unit_vacancy:        occupancySummaryStrategy,  // FIX: correct AppFolio report type name
+  // ── Occupancy ───────────────────────────────────────────────────────────────────
+  unit_vacancy:        unitVacancyStrategy,       // canonical AppFolio report type
+  occupancy_summary:   occupancySummaryStrategy,  // legacy — kept for historical Bronze records
 
-  // ── Turnover: legacy key preserved for historical Bronze records ──────────
-  // The AppFolio API uses 'unit_turn_detail' as the canonical report type name.
-  // 'move_in_move_out' was the original (incorrect) name used during early
-  // development. Both keys map to the same strategy for backward compatibility.
-  move_in_move_out:    moveInMoveOutStrategy,     // legacy — kept for historical records
-  unit_turn_detail:    moveInMoveOutStrategy,     // FIX: correct AppFolio report type name
+  // ── Turnover ───────────────────────────────────────────────────────────────────
+  unit_turn_detail:    unitTurnDetailStrategy,    // canonical AppFolio report type
+  move_in_move_out:    moveInMoveOutStrategy,     // legacy — kept for historical Bronze records
 
   // ── Planned (add handlers here as they are implemented) ──────────────────
   // maintenance_request: maintenanceRequestStrategy,
