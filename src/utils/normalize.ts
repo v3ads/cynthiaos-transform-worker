@@ -39,17 +39,37 @@ export function normalizeTenantId(name: unknown, _unit?: unknown): string {
 }
 
 /**
- * Normalise a unit_id to a consistent lowercase, underscore-separated string.
+ * Normalise a unit_id to a consistent lowercase, hyphen-separated string.
+ *
+ * AppFolio uses ' - ' (space-hyphen-space) for student unit sub-designations,
+ * e.g. '114 - A' and '120 - B'. These must be collapsed to a single hyphen
+ * BEFORE spaces are removed, so the result is '114-a' and '120-b' — not
+ * '114_-_a' which breaks cross-table JOINs.
+ *
+ * Algorithm:
+ *   1. Trim leading/trailing whitespace.
+ *   2. Collapse any sequence of optional-spaces + hyphen + optional-spaces
+ *      into a single hyphen (handles ' - ', '- ', ' -', '-').
+ *   3. Lowercase the entire string.
+ *   4. Remove any remaining whitespace characters.
+ *   5. Strip characters that are not alphanumeric, hyphen, or underscore.
  *
  * Examples:
- *   normalizeUnitId("101A")  → "101a"
- *   normalizeUnitId("  202 B ") → "202_b"
+ *   normalizeUnitId("101")        → "101"
+ *   normalizeUnitId("114 - A")   → "114-a"
+ *   normalizeUnitId("120 - B")   → "120-b"
+ *   normalizeUnitId("220_dnu-b") → "220_dnu-b"
+ *   normalizeUnitId("  202 B ")  → "202b"
  */
 export function normalizeUnitId(val: unknown): string {
   if (!val) return "unknown";
   return String(val)
     .trim()
+    // Collapse ' - ' (AppFolio student unit separator) into a single hyphen
+    .replace(/\s*-\s*/g, "-")
     .toLowerCase()
-    .replace(/\s+/g, "_")
+    // Remove any remaining whitespace
+    .replace(/\s+/g, "")
+    // Strip characters that are not alphanumeric, hyphen, or underscore
     .replace(/[^a-z0-9_-]/g, "");
 }

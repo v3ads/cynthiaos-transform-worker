@@ -2,16 +2,22 @@
 //
 // Handles the AppFolio "unit_vacancy" report type.
 //
-// AppFolio sends one row per unit with PascalCase fields:
-//   { Unit, UnitId, UnitStatus, Property, PropertyId, SqFt, UnitType,
-//     SchdRent, AdvertisedRent, DaysVacant, RentReady, AvailableOn, ... }
+// IMPORTANT: The AppFolio unit_vacancy report ONLY sends vacant and notice
+// units. It does NOT include occupied units. The total unit count (182) is
+// a fixed property-level constant derived from the unit_directory report.
 //
-// UnitStatus values observed: "Occupied", "Vacant-Unrented", "Vacant-Rented",
-//   "Notice-Unrented", "Notice-Rented", "Model", "Down"
+// AppFolio sends one row per vacant/notice unit with PascalCase fields:
+//   { Unit, UnitId, UnitStatus, Property, PropertyId, SqFt, ... }
 //
-// Silver: counts units by status category → { total_units, occupied_units,
-//         vacant_units, notice_units, occupancy_rate, vacancy_rate }
+// UnitStatus values observed in this report:
+//   "Vacant-Unrented", "Vacant-Rented", "Notice-Unrented", "Notice-Rented"
 //
+// Occupancy definition (per business requirement):
+//   occupied_units = TOTAL_UNITS - vacant_units - notice_units
+//   occupancy_rate = occupied_units / TOTAL_UNITS
+//   vacancy_rate   = (vacant_units + notice_units) / TOTAL_UNITS
+//
+// Silver: counts vacant/notice rows → derives occupied from total constant.
 // Gold:   promotes one snapshot row per report into gold_occupancy_snapshots.
 //         Idempotent via ON CONFLICT (report_date, content_hash) DO UPDATE.
 
@@ -23,16 +29,13 @@ import {
   SilverAppfolioReport,
 } from "../types";
 
-// ── Numeric helpers ───────────────────────────────────────────────────────────
-
-function toInt(val: unknown, fallback = 0): number {
-  if (val === null || val === undefined) return fallback;
-  const n = Number(val);
-  return Number.isFinite(n) ? Math.round(n) : fallback;
-}
+// ── Property constant ─────────────────────────────────────────────────────────
+// Total rentable units across all properties managed in AppFolio.
+// Source: unit_directory report (19 property records, 182 distinct UnitName values).
+// Update this constant only if the property portfolio changes.
+const TOTAL_UNITS = 182;
 
 // ── Date extraction helper ────────────────────────────────────────────────────
-
 function toDateStr(val: unknown, fallback: string): string {
   if (!val) return fallback;
   if (val instanceof Date) return val.toISOString().slice(0, 10);
@@ -47,23 +50,19 @@ function toDateStr(val: unknown, fallback: string): string {
 }
 
 // ── Classify a UnitStatus string ──────────────────────────────────────────────
-//
-// Returns "occupied", "vacant", or "notice" based on the UnitStatus value.
-
-function classifyStatus(status: string): "occupied" | "vacant" | "notice" | "other" {
+// The unit_vacancy report only sends vacant/notice units, but we classify
+// defensively in case AppFolio ever includes other statuses.
+function classifyStatus(status: string): "vacant" | "notice" | "other" {
   const s = status.toLowerCase().trim();
-  if (s.startsWith("occupied") || s === "rented" || s === "leased") return "occupied";
-  if (s.startsWith("vacant"))  return "vacant";
-  if (s.startsWith("notice"))  return "notice";
-  return "other"; // model, down, etc.
+  if (s.startsWith("vacant")) return "vacant";
+  if (s.startsWith("notice")) return "notice";
+  return "other"; // occupied, model, down — not expected in this report
 }
 
 // ── Strategy ─────────────────────────────────────────────────────────────────
-
 export const unitVacancyStrategy: TransformStrategy = {
 
   // ── Silver normalisation ──────────────────────────────────────────────────
-
   normalizeSilver(ctx: TransformContext): SilverNormalizeResult {
     const raw   = ctx.bronze.raw_data;
     const today = new Date().toISOString().slice(0, 10);
@@ -81,43 +80,40 @@ export const unitVacancyStrategy: TransformStrategy = {
       ? (raw.rows as Record<string, unknown>[])
       : [];
 
-    let occupiedUnits = 0;
-    let vacantUnits   = 0;
-    let noticeUnits   = 0;
+    let vacantUnits = 0;
+    let noticeUnits = 0;
 
     for (const row of rows) {
-      // AppFolio PascalCase: UnitStatus; also support legacy snake_case
       const status = String(row.UnitStatus ?? row.unit_status ?? row.status ?? "");
       const cat = classifyStatus(status);
-      if (cat === "occupied") occupiedUnits++;
-      else if (cat === "vacant") vacantUnits++;
+      if (cat === "vacant") vacantUnits++;
       else if (cat === "notice") noticeUnits++;
-      // "other" (model, down) not counted in totals
+      // "other" rows (occupied, model, down) are ignored — not expected here
     }
 
-    const totalUnits    = occupiedUnits + vacantUnits + noticeUnits;
-    const occupancyRate = totalUnits > 0 ? occupiedUnits / totalUnits : null;
-    const vacancyRate   = totalUnits > 0 ? vacantUnits  / totalUnits : null;
+    // Occupied = all units not reported as vacant or notice
+    const occupiedUnits = TOTAL_UNITS - vacantUnits - noticeUnits;
+    const occupancyRate = occupiedUnits / TOTAL_UNITS;
+    const vacancyRate   = (vacantUnits + noticeUnits) / TOTAL_UNITS;
 
     return {
       normalized_data: {
-        source:         "appfolio",
-        report_type:    ctx.bronze.report_type,
-        report_date:    reportDate,
+        source:           "appfolio",
+        report_type:      ctx.bronze.report_type,
+        report_date:      reportDate,
         bronze_report_id: ctx.bronze.id,
-        transformed_at: new Date().toISOString(),
-        total_units:    totalUnits,
-        occupied_units: occupiedUnits,
-        vacant_units:   vacantUnits,
-        notice_units:   noticeUnits,
-        occupancy_rate: occupancyRate,
-        vacancy_rate:   vacancyRate,
+        transformed_at:   new Date().toISOString(),
+        total_units:      TOTAL_UNITS,
+        occupied_units:   occupiedUnits,
+        vacant_units:     vacantUnits,
+        notice_units:     noticeUnits,
+        occupancy_rate:   occupancyRate,
+        vacancy_rate:     vacancyRate,
       },
     };
   },
 
   // ── Gold promotion ────────────────────────────────────────────────────────
-
   async promoteGold(
     ctx: TransformContext & { silver: SilverAppfolioReport }
   ): Promise<GoldPromoteResult> {
@@ -126,13 +122,16 @@ export const unitVacancyStrategy: TransformStrategy = {
       total_units:    number;
       occupied_units: number;
       vacant_units:   number;
-      occupancy_rate: number | null;
-      vacancy_rate:   number | null;
+      notice_units:   number;
+      occupancy_rate: number;
+      vacancy_rate:   number;
     };
 
     const contentHash = require("crypto")
       .createHash("md5")
-      .update(`${nd.report_date}|${nd.total_units}|${nd.occupied_units}|${nd.vacant_units}`)
+      .update(
+        `${nd.report_date}|${nd.total_units}|${nd.occupied_units}|${nd.vacant_units}|${nd.notice_units}`
+      )
       .digest("hex");
 
     const rows = await ctx.sql`
