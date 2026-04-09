@@ -39,13 +39,15 @@ function classifyStatus(status: string): "vacant" | "notice" | null {
 }
 
 /**
- * Derive total_units dynamically from the database.
+ * Derive total_units from the canonical gold_units table.
  *
  * Priority:
- *   1. SUM of jsonb_array_length(raw_data->'results') across all unit_directory
- *      Bronze chunks for the same report_date.
- *   2. COUNT(DISTINCT unit_id) from gold_lease_expirations (leased units only —
- *      may undercount vacant units, but is a reasonable fallback).
+ *   1. COUNT(*) from gold_units — the canonical unit roster populated by
+ *      the unit_directory transform strategy. This is the authoritative
+ *      source for the entire system.
+ *   2. SUM of jsonb_array_length(raw_data->'results') across all unit_directory
+ *      Bronze chunks for the same report_date (fallback if gold_units not yet
+ *      populated, e.g. first pipeline run).
  *   3. Previous gold_occupancy_snapshots total_units (historical fallback).
  *
  * Returns { total: number, source: string }
@@ -54,7 +56,20 @@ async function deriveTotalUnits(
   sql: TransformContext["sql"],
   reportDate: string
 ): Promise<{ total: number; source: string }> {
-  // Source 1: unit_directory Bronze chunks for same report_date
+  // Source 1: gold_units — canonical unit roster (preferred)
+  try {
+    const rows = await sql`
+      SELECT COUNT(*)::int AS cnt FROM gold_units
+    `;
+    const cnt = Number((rows as any)[0]?.cnt ?? 0);
+    if (cnt > 0) {
+      return { total: cnt, source: "gold_units" };
+    }
+  } catch (err) {
+    console.warn(`[unit_vacancy] gold_units query failed: ${err}`);
+  }
+
+  // Source 2: unit_directory Bronze chunks for same report_date (bootstrap fallback)
   try {
     const rows = await sql`
       SELECT COALESCE(SUM(jsonb_array_length(raw_data->'results')), 0) AS cnt
@@ -67,22 +82,7 @@ async function deriveTotalUnits(
       return { total: cnt, source: "unit_directory_bronze" };
     }
   } catch (err) {
-    console.warn(`[unit_vacancy] unit_directory query failed: ${err}`);
-  }
-
-  // Source 2: distinct unit_ids from gold_lease_expirations
-  try {
-    const rows = await sql`
-      SELECT COUNT(DISTINCT unit_id)::int AS cnt
-      FROM gold_lease_expirations
-      WHERE unit_id IS NOT NULL AND unit_id != 'unknown'
-    `;
-    const cnt = Number((rows as any)[0]?.cnt ?? 0);
-    if (cnt > 0) {
-      return { total: cnt, source: "gold_lease_expirations_distinct" };
-    }
-  } catch (err) {
-    console.warn(`[unit_vacancy] gold_lease_expirations fallback failed: ${err}`);
+    console.warn(`[unit_vacancy] unit_directory bronze fallback failed: ${err}`);
   }
 
   // Source 3: previous snapshot

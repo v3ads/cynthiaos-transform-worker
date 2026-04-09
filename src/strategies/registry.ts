@@ -21,6 +21,7 @@ import { unitTurnDetailStrategy }    from "./unit_turn_detail";
 // Legacy strategies kept for backward compatibility with historical Bronze records
 import { occupancySummaryStrategy }  from "./occupancy_summary";
 import { moveInMoveOutStrategy }     from "./move_in_move_out";
+import { unitDirectoryStrategy }     from "./unit_directory";
 import { unsupportedStrategy }       from "./unsupported";
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -32,6 +33,9 @@ const TRANSFORM_STRATEGIES: Record<string, TransformStrategy> = {
   aged_receivables:    agedReceivablesStrategy,
   tenant_directory:    tenantDirectoryStrategy,
   income_statement:    incomeStatementStrategy,
+
+  // ── Unit Directory (canonical unit source) ────────────────────────────────────
+  unit_directory:      unitDirectoryStrategy,     // canonical unit roster → gold_units
 
   // ── Occupancy ───────────────────────────────────────────────────────────────────
   unit_vacancy:        unitVacancyStrategy,       // canonical AppFolio report type
