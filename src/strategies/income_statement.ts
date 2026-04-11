@@ -84,7 +84,7 @@ function deriveProfitMargin(noi: number, totalIncome: number): number | null {
 // Summary rows: AccountName starts with "Total" (no AccountNumber)
 //
 // FIX (2026-04-08): Added AppFolio PascalCase field support.
-// Uses MonthToDate as the primary amount (current period).
+// FIX (2026-04-11): Use YearToDate as the primary amount (YTD gross revenue).
 
 function extractFromRows(rows: Record<string, unknown>[]): {
   totalIncome: number;
@@ -105,9 +105,9 @@ function extractFromRows(rows: Record<string, unknown>[]): {
     // AppFolio PascalCase; also support legacy snake_case
     const accountName   = String(row.AccountName   ?? row.category ?? row.account ?? row.line_item ?? row.description ?? "");
     const accountNumber = String(row.AccountNumber ?? row.account_number ?? "");
-    // Use MonthToDate as the primary amount; fall back to legacy field names
+    // Use YearToDate as the primary amount (YTD gross revenue); fall back to MonthToDate then legacy field names
     const amt = toNum(
-      row.MonthToDate ?? row.month_to_date ?? row.amount ?? row.value ?? row.total ?? 0
+      row.YearToDate ?? row.year_to_date ?? row.MonthToDate ?? row.month_to_date ?? row.amount ?? row.value ?? row.total ?? 0
     );
 
     const nameLower = accountName.toLowerCase();
