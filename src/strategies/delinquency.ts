@@ -9,6 +9,12 @@
 //   `balance_due ?? total_balance` to handle both the current Silver schema
 //   (which stores `unit` + `total_balance`) and the new schema going forward.
 //   Silver normalization updated to store `unit_id` + `balance_due` consistently.
+//
+// FIX (2026-04-11): days_overdue was incorrectly storing dollar amounts from
+//   AppFolio's aging bucket fields (30Plus, 60Plus, 90Plus are DOLLAR amounts,
+//   not day counts). Corrected to derive actual calendar days from which bucket
+//   has a non-zero balance. Also added 5-day grace period logic: balances with
+//   0To30 > 0 after the 5th of the month are treated as 6 days overdue.
 
 import {
   TransformContext,
@@ -43,12 +49,63 @@ function toNum(v: unknown): number {
   return 0;
 }
 
-// ── Risk level derivation ─────────────────────────────────────────────────────
+// ── Days overdue derivation ───────────────────────────────────────────────────
+//
+// AppFolio delinquency report aging buckets are DOLLAR amounts, not day counts:
+//   0To30   = balance aged 0–30 days (dollars)
+//   30Plus  = balance aged 30+ days (dollars)
+//   30To60  = balance aged 30–60 days (dollars)
+//   60Plus  = balance aged 60+ days (dollars)
+//   60To90  = balance aged 60–90 days (dollars)
+//   90Plus  = balance aged 90+ days (dollars)
+//
+// We derive actual days overdue from which buckets are non-zero:
+//   90Plus > 0  → 90 days overdue
+//   60Plus > 0  → 60 days overdue
+//   30Plus > 0  → 30 days overdue
+//   0To30  > 0  → within 0–30 days; apply grace period logic below
+//   all zero    → 0 (not yet due or current)
+//
+// Grace period: Cynthia Gardens allows until the 5th to pay rent.
+// If today is after the 5th and 0To30 > 0 but 30Plus = 0, treat as 6 days overdue.
 
-function deriveRiskLevel(daysOverdue: number | null): "low" | "medium" | "high" {
-  if (daysOverdue === null || daysOverdue === undefined) return "low";
-  if (daysOverdue > 30) return "high";
-  if (daysOverdue >= 15) return "medium";
+function deriveDaysOverdue(
+  row: Record<string, unknown>,
+  reportDate: string | null
+): number {
+  const ninetyPlus = toNum(row["90Plus"] ?? 0);
+  const sixtyPlus  = toNum(row["60Plus"]  ?? 0);
+  const thirtyPlus = toNum(row["30Plus"]  ?? 0);
+  const zeroToThirty = toNum(row["0To30"] ?? 0);
+
+  // Determine the reference date: use report_date if available, else today
+  const refDate = reportDate ? new Date(reportDate) : new Date();
+  const dayOfMonth = refDate.getDate();
+  const GRACE_PERIOD_END = 5; // tenants have until the 5th
+
+  if (ninetyPlus > 0) return 90;
+  if (sixtyPlus > 0)  return 60;
+  if (thirtyPlus > 0) return 30;
+  if (zeroToThirty > 0) {
+    // Within the 0–30 day bucket. Apply grace period:
+    // If today is after the 5th, this balance is late (treat as 6 days overdue).
+    // If on or before the 5th, it may still be within grace (treat as 0).
+    return dayOfMonth > GRACE_PERIOD_END ? 6 : 0;
+  }
+  return 0;
+}
+
+// ── Risk level derivation ─────────────────────────────────────────────────────
+//
+// Based on actual days overdue (after grace period logic):
+//   0          → low  (current or within grace period)
+//   1–30       → low  (recently late, within first month)
+//   31–90      → medium
+//   91+        → high
+
+function deriveRiskLevel(daysOverdue: number): "low" | "medium" | "high" {
+  if (daysOverdue >= 91) return "high";
+  if (daysOverdue >= 31) return "medium";
   return "low";
 }
 
@@ -66,21 +123,14 @@ export const delinquencyStrategy: TransformStrategy = {
       : [];
     const summary = (raw.summary ?? {}) as Record<string, unknown>;
 
+    const reportDate = ctx.bronze.report_date ?? null;
+
     const normalizedRows = rows.map((r) => {
       // AppFolio delinquency PascalCase fields:
-      //   Name, Unit, AmountReceivable, 30Plus, 60Plus, 90Plus, LastPayment
-      const thirtyPlus  = toNum(r["30Plus"]  ?? r.days_overdue ?? r.days_past_due ?? 0);
-      const sixtyPlus   = toNum(r["60Plus"]  ?? 0);
-      const ninetyPlus  = toNum(r["90Plus"]  ?? 0);
+      //   Name, Unit, AmountReceivable, 0To30, 30Plus, 30To60, 60Plus, 60To90, 90Plus, LastPayment
 
-      // Derive days_overdue from aging buckets
-      const daysOverdue: number | null =
-        ninetyPlus > 0 ? 90
-        : sixtyPlus > 0 ? 60
-        : thirtyPlus > 0 ? 30
-        : typeof r.days_overdue === "number" ? r.days_overdue
-        : typeof r.days_past_due === "number" ? r.days_past_due
-        : null;
+      // Derive actual calendar days overdue (NOT dollar amounts)
+      const daysOverdue = deriveDaysOverdue(r, reportDate);
 
       // Balance: AppFolio uses AmountReceivable; also support legacy field names
       const balanceDue = toNum(
@@ -159,7 +209,9 @@ export const delinquencyStrategy: TransformStrategy = {
 
       // FIX: Silver may store balance as `balance_due` (new) or `total_balance` (legacy)
       const balanceDue  = toNum(row.balance_due ?? row.total_balance ?? 0);
-      const daysOverdue = typeof row.days_overdue === "number" ? row.days_overdue : null;
+
+      // days_overdue is now a real calendar day count (0–365), never a dollar amount
+      const daysOverdue = typeof row.days_overdue === "number" ? row.days_overdue : 0;
       const riskLevel   = deriveRiskLevel(daysOverdue);
 
       // Use UPSERT so re-running Gold promotion corrects existing bad records
