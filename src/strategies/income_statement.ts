@@ -1,18 +1,21 @@
 // ── income_statement strategy ─────────────────────────────────────────────────
 //
 // Silver: normalises an AppFolio income statement report into a single summary
-//         row per report:
-//         { report_date, total_income, rental_income, other_income,
-//           total_expenses, operating_expenses, net_operating_income }
+//         row per report with BOTH YearToDate and MonthToDate figures:
+//         { report_date,
+//           total_income_ytd, rental_income_ytd, other_income_ytd,
+//           total_expenses_ytd, operating_expenses_ytd, noi_ytd,
+//           total_income_mtd, rental_income_mtd, other_income_mtd,
+//           total_expenses_mtd, operating_expenses_mtd, noi_mtd }
 //
 // Gold:   promotes one row per report into gold_income_statements.
-//         Derives profit_margin = net_operating_income / total_income.
-//         Idempotent via UNIQUE constraint on bronze_report_id.
+//         Stores both YTD and MTD columns.
+//         Derives profit_margin from YTD figures.
+//         Idempotent via UNIQUE constraint on (report_date, content_hash).
 //
 // Note:   AppFolio income statements are property-level summaries, not
-//         per-tenant rows. The payload may arrive as a flat summary object
-//         OR as a rows array where each row is a line-item category.
-//         Both shapes are handled.
+//         per-tenant rows. The payload arrives as a flat list of account rows
+//         where each row has both MonthToDate and YearToDate columns.
 
 import {
   TransformContext,
@@ -28,6 +31,7 @@ interface GoldIncomeStatement {
   id: string;
   bronze_report_id: string | null;
   report_date: Date;
+  // YTD
   total_income: string;
   rental_income: string;
   other_income: string;
@@ -35,6 +39,13 @@ interface GoldIncomeStatement {
   operating_expenses: string;
   net_operating_income: string;
   profit_margin: string | null;
+  // MTD
+  total_income_mtd: string;
+  rental_income_mtd: string;
+  other_income_mtd: string;
+  total_expenses_mtd: string;
+  operating_expenses_mtd: string;
+  net_operating_income_mtd: string;
   created_at: Date;
 }
 
@@ -53,7 +64,6 @@ function toNum(val: unknown): number {
 
 function toDateStr(val: unknown, fallback: string): string {
   if (!val) return fallback;
-  // Handle Date objects returned by the postgres driver for DATE columns
   if (val instanceof Date) return val.toISOString().slice(0, 10);
   const s = String(val).trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
@@ -61,7 +71,6 @@ function toDateStr(val: unknown, fallback: string): string {
     const [m, d, y] = s.split("/");
     return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
   }
-  // Handle ISO datetime strings like "2025-03-31T00:00:00.000Z"
   if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return s.slice(0, 10);
   return fallback;
 }
@@ -73,99 +82,102 @@ function deriveProfitMargin(noi: number, totalIncome: number): number | null {
   return noi / totalIncome;
 }
 
-// ── Extract summary from rows array (line-item format) ────────────────────────
+// ── Extract summary from rows array (AppFolio line-item format) ───────────────
 //
-// AppFolio exports income statements as a list of account line items:
-//   [{ AccountName: "Rent", AccountNumber: "4530", MonthToDate: "238,147.00",
-//      YearToDate: "1,015,600.32", ... }, ...]
+// AppFolio exports income statements as a flat list of account line items:
+//   [{ AccountName: "Rent", AccountNumber: "4530",
+//      MonthToDate: "247,847.00", YearToDate: "1,025,300.32", ... }, ...]
 //
-// Income accounts: AccountNumber 4xxx (positive = income)
-// Expense accounts: AccountNumber 6xxx (positive = expense)
-// Summary rows: AccountName starts with "Total" (no AccountNumber)
+// Summary rows have no AccountNumber:
+//   { AccountName: "Total Income", AccountNumber: null,
+//     MonthToDate: "145,536.50", YearToDate: "918,254.74" }
 //
-// FIX (2026-04-08): Added AppFolio PascalCase field support.
-// FIX (2026-04-11): Use YearToDate as the primary amount (YTD gross revenue).
+// This function extracts BOTH YTD and MTD figures in a single pass.
 
-function extractFromRows(rows: Record<string, unknown>[]): {
-  totalIncome: number;
-  rentalIncome: number;
-  otherIncome: number;
-  totalExpenses: number;
-  operatingExpenses: number;
-  noi: number;
-} {
-  let rentalIncome = 0;
-  let otherIncome = 0;
-  let totalExpenses = 0;
-  let totalIncomeFromSummary = 0;
-  let totalExpenseFromSummary = 0;
-  let hasSummaryRows = false;
+interface IncomeExtract {
+  ytd: { totalIncome: number; rentalIncome: number; otherIncome: number; totalExpenses: number; operatingExpenses: number; noi: number; };
+  mtd: { totalIncome: number; rentalIncome: number; otherIncome: number; totalExpenses: number; operatingExpenses: number; noi: number; };
+}
+
+function extractFromRows(rows: Record<string, unknown>[]): IncomeExtract {
+  // Accumulators for YTD
+  let ytdRental = 0, ytdOther = 0, ytdExpenses = 0;
+  let ytdTotalFromSummary = 0, ytdExpenseFromSummary = 0, ytdHasSummary = false;
+
+  // Accumulators for MTD
+  let mtdRental = 0, mtdOther = 0, mtdExpenses = 0;
+  let mtdTotalFromSummary = 0, mtdExpenseFromSummary = 0, mtdHasSummary = false;
+
+  const parseAmt = (val: unknown): number =>
+    toNum(String(val ?? "0").replace(/,/g, ""));
 
   for (const row of rows) {
-    // AppFolio PascalCase; also support legacy snake_case
-    const accountName   = String(row.AccountName   ?? row.category ?? row.account ?? row.line_item ?? row.description ?? "");
-    const accountNumber = String(row.AccountNumber ?? row.account_number ?? "");
-    // Use YearToDate as the primary amount (YTD gross revenue); fall back to MonthToDate then legacy field names
-    const amt = toNum(
-      row.YearToDate ?? row.year_to_date ?? row.MonthToDate ?? row.month_to_date ?? row.amount ?? row.value ?? row.total ?? 0
-    );
+    const accountName   = String(row.AccountName   ?? row.category ?? row.account ?? row.description ?? "").trim();
+    const accountNumber = String(row.AccountNumber ?? row.account_number ?? "").trim();
+    const nameLower     = accountName.toLowerCase();
 
-    const nameLower = accountName.toLowerCase();
+    const ytd = parseAmt(row.YearToDate  ?? row.year_to_date  ?? row.amount ?? 0);
+    const mtd = parseAmt(row.MonthToDate ?? row.month_to_date ?? row.amount ?? 0);
 
-    // Summary rows (no account number, name starts with "Total")
-    if (!accountNumber && nameLower.startsWith("total income")) {
-      totalIncomeFromSummary = amt;
-      hasSummaryRows = true;
-      continue;
-    }
-    if (!accountNumber && nameLower.startsWith("total expense")) {
-      totalExpenseFromSummary = Math.abs(amt);
-      hasSummaryRows = true;
-      continue;
-    }
-    if (!accountNumber) continue; // skip other summary rows
-
-    const acctNum = parseInt(accountNumber, 10);
-
-    // Income accounts: 4000–4999 (AppFolio convention)
-    if (acctNum >= 4000 && acctNum < 5000) {
-      const absAmt = Math.abs(amt); // some income rows are negative (concessions, prepaid)
-      // Account 4530 = Rent (primary rental income)
-      if (acctNum === 4530 || nameLower.includes("rent") && !nameLower.includes("expense")) {
-        rentalIncome += absAmt;
-      } else {
-        otherIncome += absAmt;
+    // ── Summary rows (no AccountNumber) ──────────────────────────────────────
+    if (!accountNumber || accountNumber === "null") {
+      if (nameLower === "total income" || nameLower === "total revenue") {
+        ytdTotalFromSummary = ytd;
+        mtdTotalFromSummary = mtd;
+        ytdHasSummary = mtdHasSummary = true;
+      } else if (nameLower === "total expense" || nameLower === "total expenses") {
+        ytdExpenseFromSummary = Math.abs(ytd);
+        mtdExpenseFromSummary = Math.abs(mtd);
+        ytdHasSummary = mtdHasSummary = true;
       }
+      continue;
     }
-    // Expense accounts: 6000–6999 (AppFolio convention)
-    else if (acctNum >= 6000 && acctNum < 7000) {
-      totalExpenses += Math.abs(amt);
+
+    // ── Individual account rows ───────────────────────────────────────────────
+    const acctInt = parseInt(accountNumber, 10);
+    if (isNaN(acctInt)) continue;
+
+    if (acctInt >= 4000 && acctInt < 5000) {
+      // Income accounts (4xxx)
+      if (acctInt === 4530 || (nameLower.includes("rent") && !nameLower.includes("expense"))) {
+        // Primary Rent account
+        ytdRental += ytd;
+        mtdRental += mtd;
+      } else {
+        // Other income (fees, laundry, misc, etc.)
+        ytdOther += ytd;
+        mtdOther += mtd;
+      }
+    } else if (acctInt >= 6000 && acctInt < 7000) {
+      // Expense accounts (6xxx)
+      ytdExpenses += Math.abs(ytd);
+      mtdExpenses += Math.abs(mtd);
     }
   }
 
-  // Prefer the "Total Income" / "Total Expense" summary rows if present
-  const finalTotalIncome   = hasSummaryRows && totalIncomeFromSummary > 0
-    ? totalIncomeFromSummary
-    : rentalIncome + otherIncome;
-  const finalTotalExpenses = hasSummaryRows && totalExpenseFromSummary > 0
-    ? totalExpenseFromSummary
-    : totalExpenses;
-
-  // If we used summary rows, back-calculate rental vs other income split
-  if (hasSummaryRows && totalIncomeFromSummary > 0 && rentalIncome === 0) {
-    rentalIncome = finalTotalIncome;
-  }
-
-  const operatingExpenses = finalTotalExpenses; // all AppFolio expenses are operating
-  const noi = finalTotalIncome - finalTotalExpenses;
+  // Use AppFolio summary rows when present; fall back to summed individual rows
+  const ytdTotalIncome   = ytdHasSummary && ytdTotalFromSummary !== 0 ? ytdTotalFromSummary : ytdRental + ytdOther;
+  const ytdTotalExpenses = ytdHasSummary && ytdExpenseFromSummary !== 0 ? ytdExpenseFromSummary : ytdExpenses;
+  const mtdTotalIncome   = mtdHasSummary && mtdTotalFromSummary !== 0 ? mtdTotalFromSummary : mtdRental + mtdOther;
+  const mtdTotalExpenses = mtdHasSummary && mtdExpenseFromSummary !== 0 ? mtdExpenseFromSummary : mtdExpenses;
 
   return {
-    totalIncome:       finalTotalIncome,
-    rentalIncome,
-    otherIncome,
-    totalExpenses:     finalTotalExpenses,
-    operatingExpenses,
-    noi,
+    ytd: {
+      totalIncome:       ytdTotalIncome,
+      rentalIncome:      ytdRental,
+      otherIncome:       ytdOther,
+      totalExpenses:     ytdTotalExpenses,
+      operatingExpenses: ytdTotalExpenses,
+      noi:               ytdTotalIncome - ytdTotalExpenses,
+    },
+    mtd: {
+      totalIncome:       mtdTotalIncome,
+      rentalIncome:      mtdRental,
+      otherIncome:       mtdOther,
+      totalExpenses:     mtdTotalExpenses,
+      operatingExpenses: mtdTotalExpenses,
+      noi:               mtdTotalIncome - mtdTotalExpenses,
+    },
   };
 }
 
@@ -176,27 +188,14 @@ export const incomeStatementStrategy: TransformStrategy = {
   // ── Silver normalisation ──────────────────────────────────────────────────
 
   normalizeSilver(ctx: TransformContext): SilverNormalizeResult {
-    const raw     = ctx.bronze.raw_data;
-    const today   = new Date().toISOString().slice(0, 10);
-    // ctx.reportDate is the pre-computed YYYY-MM-DD string from the transform worker
-    // (derived from bronze.report_date before the strategy is called).
-    // Fall back to raw payload fields, then today as last resort.
+    const raw   = ctx.bronze.raw_data;
+    const today = new Date().toISOString().slice(0, 10);
     const reportDate =
       ctx.reportDate ||
       toDateStr(
         ctx.bronze.report_date ?? raw.report_date ?? raw.period_end ?? raw.as_of_date,
         today
       );
-
-    // Support two payload shapes:
-    //   1. Flat summary: { total_income, rental_income, ... }
-    //   2. Rows array:   [{ category, amount }, ...]
-    let totalIncome: number;
-    let rentalIncome: number;
-    let otherIncome: number;
-    let totalExpenses: number;
-    let operatingExpenses: number;
-    let noi: number;
 
     // Support both AppFolio native format (raw.results) and legacy format (raw.rows)
     const rows = Array.isArray(raw.results)
@@ -205,30 +204,28 @@ export const incomeStatementStrategy: TransformStrategy = {
       ? (raw.rows as Record<string, unknown>[])
       : [];
 
+    let ytd: IncomeExtract["ytd"];
+    let mtd: IncomeExtract["mtd"];
+
     if (rows.length > 0) {
-      // Shape 2: line-item rows
       const extracted = extractFromRows(rows);
-      totalIncome       = extracted.totalIncome;
-      rentalIncome      = extracted.rentalIncome;
-      otherIncome       = extracted.otherIncome;
-      totalExpenses     = extracted.totalExpenses;
-      operatingExpenses = extracted.operatingExpenses;
-      noi               = extracted.noi;
+      ytd = extracted.ytd;
+      mtd = extracted.mtd;
     } else {
-      // Shape 1: flat summary object (may be nested under raw.summary or raw directly)
+      // Flat summary object fallback (legacy shape)
       const src = (raw.summary ?? raw) as Record<string, unknown>;
-      rentalIncome      = toNum(src.rental_income      ?? src.rent_income     ?? src.gross_rent      ?? 0);
-      otherIncome       = toNum(src.other_income       ?? src.misc_income     ?? src.other_revenue   ?? 0);
-      totalIncome       = toNum(src.total_income       ?? src.gross_income    ?? src.total_revenue   ?? 0)
-                          || (rentalIncome + otherIncome);
-      operatingExpenses = toNum(src.operating_expenses ?? src.opex            ?? src.total_opex      ?? 0);
-      totalExpenses     = toNum(src.total_expenses     ?? src.expenses        ?? src.total_costs     ?? 0)
-                          || operatingExpenses;
-      noi               = toNum(src.net_operating_income ?? src.noi           ?? src.net_income      ?? 0)
-                          || (totalIncome - totalExpenses);
+      const ti  = toNum(src.total_income ?? src.gross_income ?? src.total_revenue ?? 0);
+      const ri  = toNum(src.rental_income ?? src.rent_income ?? src.gross_rent ?? 0);
+      const oi  = toNum(src.other_income ?? src.misc_income ?? src.other_revenue ?? 0);
+      const te  = toNum(src.total_expenses ?? src.expenses ?? src.total_costs ?? 0);
+      const oe  = toNum(src.operating_expenses ?? src.opex ?? te);
+      const n   = toNum(src.net_operating_income ?? src.noi ?? src.net_income ?? 0) || (ti - te);
+      ytd = { totalIncome: ti, rentalIncome: ri, otherIncome: oi, totalExpenses: te, operatingExpenses: oe, noi: n };
+      mtd = { totalIncome: 0, rentalIncome: 0, otherIncome: 0, totalExpenses: 0, operatingExpenses: 0, noi: 0 };
     }
 
-    const profitMargin = deriveProfitMargin(noi, totalIncome);
+    const profitMarginYtd = deriveProfitMargin(ytd.noi, ytd.totalIncome);
+    const profitMarginMtd = deriveProfitMargin(mtd.noi, mtd.totalIncome);
 
     const normalized_data: Record<string, unknown> = {
       source:           "appfolio",
@@ -236,16 +233,24 @@ export const incomeStatementStrategy: TransformStrategy = {
       report_date:      reportDate,
       bronze_report_id: ctx.bronze.id,
       transformed_at:   new Date().toISOString(),
-      // Income statement is a single summary — no row array
       summary: {
-        report_date:          reportDate,
-        total_income:         totalIncome,
-        rental_income:        rentalIncome,
-        other_income:         otherIncome,
-        total_expenses:       totalExpenses,
-        operating_expenses:   operatingExpenses,
-        net_operating_income: noi,
-        profit_margin:        profitMargin,
+        report_date: reportDate,
+        // YTD
+        total_income:         ytd.totalIncome,
+        rental_income:        ytd.rentalIncome,
+        other_income:         ytd.otherIncome,
+        total_expenses:       ytd.totalExpenses,
+        operating_expenses:   ytd.operatingExpenses,
+        net_operating_income: ytd.noi,
+        profit_margin:        profitMarginYtd,
+        // MTD
+        total_income_mtd:         mtd.totalIncome,
+        rental_income_mtd:        mtd.rentalIncome,
+        other_income_mtd:         mtd.otherIncome,
+        total_expenses_mtd:       mtd.totalExpenses,
+        operating_expenses_mtd:   mtd.operatingExpenses,
+        net_operating_income_mtd: mtd.noi,
+        profit_margin_mtd:        profitMarginMtd,
       },
     };
 
@@ -269,7 +274,9 @@ export const incomeStatementStrategy: TransformStrategy = {
       };
     }
 
-    const reportDate      = String(s.report_date ?? nd.report_date ?? new Date().toISOString().slice(0, 10));
+    const reportDate  = String(s.report_date ?? nd.report_date ?? new Date().toISOString().slice(0, 10));
+
+    // YTD figures
     const totalIncome     = toNum(s.total_income);
     const rentalIncome    = toNum(s.rental_income);
     const otherIncome     = toNum(s.other_income);
@@ -279,8 +286,15 @@ export const incomeStatementStrategy: TransformStrategy = {
     const profitMargin    = typeof s.profit_margin === "number" ? s.profit_margin
                           : deriveProfitMargin(noi, totalIncome);
 
-    // Compute a stable content hash so that re-uploading identical data for the
-    // same period does not create duplicate Gold rows, regardless of bronze_report_id.
+    // MTD figures
+    const totalIncomeMtd   = toNum(s.total_income_mtd);
+    const rentalIncomeMtd  = toNum(s.rental_income_mtd);
+    const otherIncomeMtd   = toNum(s.other_income_mtd);
+    const totalExpensesMtd = toNum(s.total_expenses_mtd);
+    const opexMtd          = toNum(s.operating_expenses_mtd);
+    const noiMtd           = toNum(s.net_operating_income_mtd);
+
+    // Content hash for idempotency (based on YTD figures which are the primary values)
     const contentHash = require("crypto")
       .createHash("md5")
       .update(`${reportDate}|${totalIncome}|${totalExpenses}|${noi}`)
@@ -288,32 +302,38 @@ export const incomeStatementStrategy: TransformStrategy = {
 
     const goldRows = await sql<GoldIncomeStatement[]>`
       INSERT INTO gold_income_statements
-        (bronze_report_id, report_date, total_income, rental_income, other_income,
+        (bronze_report_id, report_date,
+         total_income, rental_income, other_income,
          total_expenses, operating_expenses, net_operating_income, profit_margin,
+         total_income_mtd, rental_income_mtd, other_income_mtd,
+         total_expenses_mtd, operating_expenses_mtd, net_operating_income_mtd,
          content_hash, created_at)
       VALUES (
         ${bronze.id},
         ${reportDate}::date,
-        ${totalIncome},
-        ${rentalIncome},
-        ${otherIncome},
-        ${totalExpenses},
-        ${opex},
-        ${noi},
-        ${profitMargin},
+        ${totalIncome}, ${rentalIncome}, ${otherIncome},
+        ${totalExpenses}, ${opex}, ${noi}, ${profitMargin},
+        ${totalIncomeMtd}, ${rentalIncomeMtd}, ${otherIncomeMtd},
+        ${totalExpensesMtd}, ${opexMtd}, ${noiMtd},
         ${contentHash},
         NOW()
       )
       ON CONFLICT (report_date, content_hash)
       DO UPDATE SET
-        bronze_report_id      = EXCLUDED.bronze_report_id,
-        total_income          = EXCLUDED.total_income,
-        rental_income         = EXCLUDED.rental_income,
-        other_income          = EXCLUDED.other_income,
-        total_expenses        = EXCLUDED.total_expenses,
-        operating_expenses    = EXCLUDED.operating_expenses,
-        net_operating_income  = EXCLUDED.net_operating_income,
-        profit_margin         = EXCLUDED.profit_margin
+        bronze_report_id          = EXCLUDED.bronze_report_id,
+        total_income              = EXCLUDED.total_income,
+        rental_income             = EXCLUDED.rental_income,
+        other_income              = EXCLUDED.other_income,
+        total_expenses            = EXCLUDED.total_expenses,
+        operating_expenses        = EXCLUDED.operating_expenses,
+        net_operating_income      = EXCLUDED.net_operating_income,
+        profit_margin             = EXCLUDED.profit_margin,
+        total_income_mtd          = EXCLUDED.total_income_mtd,
+        rental_income_mtd         = EXCLUDED.rental_income_mtd,
+        other_income_mtd          = EXCLUDED.other_income_mtd,
+        total_expenses_mtd        = EXCLUDED.total_expenses_mtd,
+        operating_expenses_mtd    = EXCLUDED.operating_expenses_mtd,
+        net_operating_income_mtd  = EXCLUDED.net_operating_income_mtd
       RETURNING *
     `;
 
