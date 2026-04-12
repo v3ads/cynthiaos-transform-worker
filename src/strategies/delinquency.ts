@@ -100,11 +100,12 @@ function deriveDaysOverdue(
 // Based on actual days overdue (after grace period logic):
 //   0          → low  (current or within grace period)
 //   1–30       → low  (recently late, within first month)
-//   31–90      → medium
-//   91+        → high
+//   31–89      → medium
+//   90+        → high  (the 90Plus AppFolio bucket maps to exactly 90 days;
+//                       using >= 90 ensures these tenants are correctly flagged)
 
 function deriveRiskLevel(daysOverdue: number): "low" | "medium" | "high" {
-  if (daysOverdue >= 91) return "high";
+  if (daysOverdue >= 90) return "high";
   if (daysOverdue >= 31) return "medium";
   return "low";
 }
