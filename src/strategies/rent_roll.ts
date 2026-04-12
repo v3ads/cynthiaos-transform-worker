@@ -123,7 +123,16 @@ export const rentRollStrategy: TransformStrategy = {
 
       // Also sync unit_status into gold_units from the rent_roll Status field.
       // This is the only AppFolio report that carries occupancy status per unit.
-      const unitStatus = String(row.status ?? "").trim() || null;
+      // Normalize AppFolio status values to lowercase canonical form:
+      //   'Current' -> 'occupied'
+      //   'Vacant-Unrented' / 'Vacant-Rented' -> 'vacant'
+      //   'Notice-Unrented' / 'Notice-Rented' -> 'notice'
+      const rawStatus = String(row.status ?? "").trim();
+      const unitStatus: string | null = rawStatus
+        ? rawStatus.toLowerCase().includes('vacant') ? 'vacant'
+          : rawStatus.toLowerCase().includes('notice') ? 'notice'
+          : 'occupied'
+        : null;
       if (unitId && unitId !== "unknown") {
         await sql`
           UPDATE gold_units
