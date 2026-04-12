@@ -93,6 +93,12 @@ export const unitDirectoryStrategy: TransformStrategy = {
         updated_at  TIMESTAMPTZ DEFAULT NOW()
       )
     `;
+    // ── Migrate: add raw_name column if the table predates this column ────
+    // CREATE TABLE IF NOT EXISTS is a no-op when the table already exists,
+    // so we must explicitly add missing columns for backward compatibility.
+    await ctx.sql`
+      ALTER TABLE gold_units ADD COLUMN IF NOT EXISTS raw_name TEXT
+    `;
 
     // ── Upsert all units ──────────────────────────────────────────────────
     // Use INSERT ... ON CONFLICT DO UPDATE to handle daily refreshes.
