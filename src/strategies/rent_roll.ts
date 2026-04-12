@@ -85,9 +85,13 @@ export const rentRollStrategy: TransformStrategy = {
     const goldIds: string[] = [];
 
     for (const row of rows) {
+      // Skip vacant units — they have no tenant and should not create lease expiration records.
+      // Vacant rows come from AppFolio with Status='Vacant-Unrented' and Tenant=null.
+      const rawName  = String(row.tenant ?? row.tenant_id ?? row.tenant_name ?? row.name ?? row.resident ?? "").trim();
+      if (!rawName) continue; // skip vacant/no-tenant rows
+
       // FIX: Use tenant name ONLY for tenant_id — never append unit number.
       // This ensures the tenant_id matches gold_tenants for cross-table JOINs.
-      const rawName  = String(row.tenant ?? row.tenant_id ?? row.tenant_name ?? row.name ?? row.resident ?? "");
       const rawUnit  = String(row.unit   ?? row.unit_id   ?? "");
       const tenantId = normalizeTenantId(rawName); // unit intentionally omitted
       const unitId   = normalizeUnitId(rawUnit);
@@ -115,6 +119,17 @@ export const rentRollStrategy: TransformStrategy = {
         daysUntilExpiration = Math.round(
           (endDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)
         );
+      }
+
+      // Also sync unit_status into gold_units from the rent_roll Status field.
+      // This is the only AppFolio report that carries occupancy status per unit.
+      const unitStatus = String(row.status ?? "").trim() || null;
+      if (unitId && unitId !== "unknown") {
+        await sql`
+          UPDATE gold_units
+          SET unit_status = ${unitStatus}, updated_at = NOW()
+          WHERE unit_id = ${unitId}
+        `;
       }
 
       // Use UPSERT so re-running Gold promotion corrects existing records
