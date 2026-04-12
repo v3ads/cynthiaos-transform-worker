@@ -198,6 +198,26 @@ export const unitVacancyStrategy: TransformStrategy = {
       .update(`${reportDate}|${totalUnits}|${occupiedUnits}|${vacantUnits}|${noticeUnits}`)
       .digest("hex");
 
+    // ── Idempotency guard: check for duplicate (report_date, content_hash) ──
+    // PostgreSQL only allows one ON CONFLICT target per INSERT statement.
+    // If a row with the same (report_date, content_hash) already exists from
+    // a different bronze_report_id (e.g., duplicate ingestion on the same day),
+    // the INSERT would violate the secondary unique constraint and crash.
+    // We pre-check and skip gracefully instead.
+    const existing = await ctx.sql`
+      SELECT id FROM gold_occupancy_snapshots
+      WHERE report_date = ${reportDate}
+        AND content_hash = ${contentHash}
+      LIMIT 1
+    `;
+    if ((existing as unknown as { id: string }[]).length > 0) {
+      console.log(
+        `[unit_vacancy] Skipping duplicate snapshot: report_date=${reportDate} ` +
+        `content_hash=${contentHash} (already exists from a different bronze record)`
+      );
+      return { gold_ids: [], skipped: true, skip_reason: "duplicate_snapshot" };
+    }
+
     const rows = await ctx.sql`
       INSERT INTO gold_occupancy_snapshots (
         bronze_report_id,
