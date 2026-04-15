@@ -183,8 +183,9 @@ export const unitTurnDetailStrategy: TransformStrategy = {
           ${totalBilled},
           NOW()
         )
-        ON CONFLICT (bronze_report_id, unit_id, move_out_date)
+        ON CONFLICT (unit_id, move_out_date)
         DO UPDATE SET
+          bronze_report_id      = EXCLUDED.bronze_report_id,
           expected_move_in_date = EXCLUDED.expected_move_in_date,
           turn_end_date         = EXCLUDED.turn_end_date,
           days_to_complete      = EXCLUDED.days_to_complete,

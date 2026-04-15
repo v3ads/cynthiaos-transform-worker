@@ -212,16 +212,17 @@ export const agedReceivablesStrategy: TransformStrategy = {
           ${riskScore},
           NOW()
         )
-        ON CONFLICT (bronze_report_id, tenant_id, unit_id)
+        ON CONFLICT (tenant_id, unit_id)
         DO UPDATE SET
-          unit_id         = EXCLUDED.unit_id,
-          total_balance   = EXCLUDED.total_balance,
-          bucket_0_30     = EXCLUDED.bucket_0_30,
-          bucket_31_60    = EXCLUDED.bucket_31_60,
-          bucket_61_90    = EXCLUDED.bucket_61_90,
-          bucket_90_plus  = EXCLUDED.bucket_90_plus,
-          dominant_bucket = EXCLUDED.dominant_bucket,
-          risk_score      = EXCLUDED.risk_score
+          bronze_report_id = EXCLUDED.bronze_report_id,
+          unit_id          = EXCLUDED.unit_id,
+          total_balance    = EXCLUDED.total_balance,
+          bucket_0_30      = EXCLUDED.bucket_0_30,
+          bucket_31_60     = EXCLUDED.bucket_31_60,
+          bucket_61_90     = EXCLUDED.bucket_61_90,
+          bucket_90_plus   = EXCLUDED.bucket_90_plus,
+          dominant_bucket  = EXCLUDED.dominant_bucket,
+          risk_score       = EXCLUDED.risk_score
         RETURNING *
       `;
 

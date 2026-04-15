@@ -215,7 +215,8 @@ export const delinquencyStrategy: TransformStrategy = {
       const daysOverdue = typeof row.days_overdue === "number" ? row.days_overdue : 0;
       const riskLevel   = deriveRiskLevel(daysOverdue);
 
-      // Use UPSERT so re-running Gold promotion corrects existing bad records
+      // UPSERT on (tenant_id, unit_id) — one delinquency record per tenant+unit.
+      // Conflicting on bronze_report_id caused a new row per daily run.
       const goldRows = await sql<GoldDelinquencyRecord[]>`
         INSERT INTO gold_delinquency_records
           (bronze_report_id, tenant_id, unit_id, balance_due, days_overdue, risk_level, created_at)
@@ -228,11 +229,12 @@ export const delinquencyStrategy: TransformStrategy = {
           ${riskLevel},
           NOW()
         )
-        ON CONFLICT (bronze_report_id, tenant_id, unit_id)
+        ON CONFLICT (tenant_id, unit_id)
         DO UPDATE SET
-          balance_due   = EXCLUDED.balance_due,
-          days_overdue  = EXCLUDED.days_overdue,
-          risk_level    = EXCLUDED.risk_level
+          bronze_report_id = EXCLUDED.bronze_report_id,
+          balance_due      = EXCLUDED.balance_due,
+          days_overdue     = EXCLUDED.days_overdue,
+          risk_level       = EXCLUDED.risk_level
         RETURNING *
       `;
 
