@@ -278,6 +278,15 @@ export const incomeStatementStrategy: TransformStrategy = {
 
     // YTD figures
     const totalIncome     = toNum(s.total_income);
+
+    // Skip blank records — a zero total_income means the Bronze report had no data
+    if (totalIncome === 0) {
+      return {
+        gold_ids:    [],
+        skipped:     true,
+        skip_reason: `Skipping income statement with zero total_income for ${reportDate} (blank report)`,
+      };
+    }
     const rentalIncome    = toNum(s.rental_income);
     const otherIncome     = toNum(s.other_income);
     const totalExpenses   = toNum(s.total_expenses);
