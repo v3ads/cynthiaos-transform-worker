@@ -141,8 +141,11 @@ export const rentRollStrategy: TransformStrategy = {
         `;
       }
 
-      // Use UPSERT so re-running Gold promotion corrects existing records
-      // that have the wrong tenant_id (with unit suffix from the old normalize logic)
+      // UPSERT on unit_id alone — each unit must have exactly ONE lease expiration record.
+      // Conflicting on (bronze_report_id, tenant_id, unit_id) was wrong: every new daily
+      // cron run produces a new bronze_report_id, so all rows were inserted fresh each time,
+      // accumulating duplicates. Conflicting on unit_id ensures the record is replaced on
+      // every run, keeping the table at one row per unit.
       const goldRows = await sql<GoldLeaseExpiration[]>`
         INSERT INTO gold_lease_expirations
           (bronze_report_id, tenant_id, unit_id, lease_start_date, lease_end_date, days_until_expiration, created_at)
@@ -155,8 +158,10 @@ export const rentRollStrategy: TransformStrategy = {
           ${daysUntilExpiration},
           NOW()
         )
-        ON CONFLICT (bronze_report_id, tenant_id, unit_id)
+        ON CONFLICT (unit_id)
         DO UPDATE SET
+          bronze_report_id       = EXCLUDED.bronze_report_id,
+          tenant_id              = EXCLUDED.tenant_id,
           lease_start_date       = EXCLUDED.lease_start_date,
           lease_end_date         = EXCLUDED.lease_end_date,
           days_until_expiration  = EXCLUDED.days_until_expiration
