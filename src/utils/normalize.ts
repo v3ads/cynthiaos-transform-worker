@@ -17,8 +17,9 @@
  * Algorithm:
  *   1. Trim whitespace from the name.
  *   2. Lowercase the entire string.
- *   3. Replace any run of non-alphanumeric characters with a single underscore.
- *   4. Strip leading/trailing underscores.
+ *   3. Strip hyphens entirely (so "powell-wonson" and "powellwonson" hash identically).
+ *   4. Replace any run of non-alphanumeric characters with a single underscore.
+ *   5. Strip leading/trailing underscores.
  *
  * The second `_unit` parameter is accepted but IGNORED — it exists only
  * for backward compatibility with call sites that previously passed the unit.
@@ -34,6 +35,7 @@ export function normalizeTenantId(name: unknown, _unit?: unknown): string {
   if (!n) return "unknown";
   return n
     .toLowerCase()
+    .replace(/-/g, "")           // strip hyphens so "powell-wonson" === "powellwonson"
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "");
 }
