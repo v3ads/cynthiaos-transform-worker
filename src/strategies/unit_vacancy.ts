@@ -57,9 +57,11 @@ async function deriveTotalUnits(
   reportDate: string
 ): Promise<{ total: number; source: string }> {
   // Source 1: gold_units — canonical unit roster (preferred)
+  // Excludes units flagged exclude_from_occupancy (e.g. family-held vacant
+  // units that are not available to lease) so they don't inflate the denominator.
   try {
     const rows = await sql`
-      SELECT COUNT(*)::int AS cnt FROM gold_units
+      SELECT COUNT(*)::int AS cnt FROM gold_units WHERE exclude_from_occupancy IS NOT TRUE
     `;
     const cnt = Number((rows as any)[0]?.cnt ?? 0);
     if (cnt > 0) {
