@@ -2,8 +2,14 @@
 //
 // Handles the AppFolio Delinquency report type.
 // Silver: normalises rows into { tenant_id, unit_id, balance_due, days_overdue,
-//                                last_payment_date, risk_level }
+//                                last_payment_date, risk_level, tenant_status }
 // Gold:   promotes each row into gold_delinquency_records with a derived risk_level
+//
+// FIX (2026-04-20): Added tenant_status field sourced from AppFolio's TenantStatus
+//   field ('Current' | 'Past'). Past-tenant balances are carry-overs from prior lease
+//   terms and must NOT inflate the current tenant's risk score in unit-intelligence.
+//   The unit-intelligence CTE splits delinquency_balance into current_delinquency_balance
+//   (tenant_status = 'current') and prior_term_balance (tenant_status = 'past').
 //
 // FIX (2026-04-08): Gold promotion now reads `unit_id ?? unit` and
 //   `balance_due ?? total_balance` to handle both the current Silver schema
@@ -35,6 +41,7 @@ interface GoldDelinquencyRecord {
   balance_due: string; // NUMERIC returns as string from postgres driver
   days_overdue: number | null;
   risk_level: string;
+  tenant_status: string; // 'current' | 'past' — sourced from AppFolio TenantStatus
   created_at: Date;
 }
 
@@ -148,6 +155,11 @@ export const delinquencyStrategy: TransformStrategy = {
       const rawName = String(r.Name ?? r.tenant ?? r.tenant_id ?? r.tenant_name ?? r.name ?? r.resident ?? "");
       const rawUnit = String(r.Unit ?? r.unit   ?? r.unit_id   ?? r.unit_number ?? "");
 
+      // AppFolio TenantStatus: 'Current' | 'Past' | 'Future'
+      // Normalise to lowercase; default to 'current' if missing
+      const rawTenantStatus = String(r.TenantStatus ?? r.tenant_status ?? 'Current').toLowerCase();
+      const tenantStatus = rawTenantStatus === 'past' ? 'past' : 'current';
+
       return {
         tenant_id:         normalizeTenantId(rawName, rawUnit),
         unit_id:           normalizeUnitId(rawUnit),
@@ -155,6 +167,7 @@ export const delinquencyStrategy: TransformStrategy = {
         days_overdue:      daysOverdue,
         last_payment_date: lastPaymentDate,
         risk_level:        deriveRiskLevel(daysOverdue),
+        tenant_status:     tenantStatus,
       };
     });
 
@@ -215,11 +228,14 @@ export const delinquencyStrategy: TransformStrategy = {
       const daysOverdue = typeof row.days_overdue === "number" ? row.days_overdue : 0;
       const riskLevel   = deriveRiskLevel(daysOverdue);
 
+      // tenant_status: 'current' | 'past' — from AppFolio TenantStatus field
+      const tenantStatus = String((row as any).tenant_status ?? 'current');
+
       // UPSERT on (tenant_id, unit_id) — one delinquency record per tenant+unit.
       // Conflicting on bronze_report_id caused a new row per daily run.
       const goldRows = await sql<GoldDelinquencyRecord[]>`
         INSERT INTO gold_delinquency_records
-          (bronze_report_id, tenant_id, unit_id, balance_due, days_overdue, risk_level, created_at)
+          (bronze_report_id, tenant_id, unit_id, balance_due, days_overdue, risk_level, tenant_status, created_at)
         VALUES (
           ${bronze.id},
           ${tenantId},
@@ -227,6 +243,7 @@ export const delinquencyStrategy: TransformStrategy = {
           ${balanceDue},
           ${daysOverdue},
           ${riskLevel},
+          ${tenantStatus},
           NOW()
         )
         ON CONFLICT (tenant_id, unit_id)
@@ -234,7 +251,8 @@ export const delinquencyStrategy: TransformStrategy = {
           bronze_report_id = EXCLUDED.bronze_report_id,
           balance_due      = EXCLUDED.balance_due,
           days_overdue     = EXCLUDED.days_overdue,
-          risk_level       = EXCLUDED.risk_level
+          risk_level       = EXCLUDED.risk_level,
+          tenant_status    = EXCLUDED.tenant_status
         RETURNING *
       `;
 
