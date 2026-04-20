@@ -2,11 +2,18 @@
 //
 // Silver: normalises AppFolio aged receivables report rows into consistent shape:
 //         { tenant_id, unit_id, total_balance,
-//           bucket_0_30, bucket_31_60, bucket_61_90, bucket_90_plus }
+//           bucket_0_30, bucket_31_60, bucket_61_90, bucket_90_plus,
+//           tenant_status }
 //
 // Gold:   promotes each row into gold_aged_receivables with derived fields:
 //         dominant_bucket — the aging bucket with the highest dollar amount
 //         risk_score      — weighted sum: 0-30→1x, 31-60→2x, 61-90→3x, 90+→5x
+//         tenant_status   — 'current' | 'past' sourced from AppFolio TenantStatus
+//
+// FIX (2026-04-20): Added tenant_status field sourced from AppFolio's TenantStatus
+//   field ('Current' | 'Past'). Past-tenant balances are carry-overs from prior lease
+//   terms and must NOT appear in Collections Risk or inflate current risk scores.
+//   The collections-risk endpoint filters WHERE tenant_status = 'current'.
 //
 // FIX (2026-04-08): Gold promotion now reads `unit_id ?? unit` to handle
 //   legacy Silver records that stored the unit number under the key `unit`.
@@ -36,6 +43,7 @@ interface GoldAgedReceivableRecord {
   bucket_90_plus: string;
   dominant_bucket: string;
   risk_score: string;
+  tenant_status: string;
   created_at: Date;
 }
 
@@ -98,13 +106,33 @@ export const agedReceivablesStrategy: TransformStrategy = {
 
     // AppFolio aged_receivables_detail has one row per invoice line, not per tenant.
     // Aggregate by tenant (PayerName + UnitName) before normalising.
-    const tenantMap = new Map<string, { rawName: string; rawUnit: string; b0_30: number; b31_60: number; b61_90: number; b90plus: number; }>();
+    // Also capture TenantStatus — take the first non-null value per tenant+unit key.
+    const tenantMap = new Map<string, {
+      rawName: string;
+      rawUnit: string;
+      b0_30: number;
+      b31_60: number;
+      b61_90: number;
+      b90plus: number;
+      tenantStatus: string;
+    }>();
+
     for (const r of rows) {
       // AppFolio PascalCase fields; also support legacy snake_case
       const rawName = String(r.PayerName ?? r.tenant ?? r.tenant_id ?? r.tenant_name ?? r.name ?? r.resident ?? "");
       const rawUnit = String(r.UnitName  ?? r.unit   ?? r.unit_id   ?? r.unit_number  ?? "");
       const key = `${rawName}||${rawUnit}`;
-      const existing = tenantMap.get(key) ?? { rawName, rawUnit, b0_30: 0, b31_60: 0, b61_90: 0, b90plus: 0 };
+
+      // AppFolio TenantStatus: 'Current' | 'Past' | 'Future'
+      // Normalise to lowercase; default to 'current' if missing
+      const rawStatus = String(r.TenantStatus ?? r.tenant_status ?? "Current").toLowerCase();
+      const tenantStatus = rawStatus === "past" ? "past" : "current";
+
+      const existing = tenantMap.get(key) ?? {
+        rawName, rawUnit, b0_30: 0, b31_60: 0, b61_90: 0, b90plus: 0,
+        tenantStatus,
+      };
+      // Keep the first status seen for this tenant (all rows for same tenant should match)
       existing.b0_30   += toNum(r["0To30"]   ?? r.bucket_0_30   ?? r["0_30"]   ?? r.current    ?? 0);
       existing.b31_60  += toNum(r["30To60"]  ?? r.bucket_31_60  ?? r["31_60"]  ?? r.days_31_60 ?? 0);
       existing.b61_90  += toNum(r["60To90"]  ?? r.bucket_61_90  ?? r["61_90"]  ?? r.days_61_90 ?? 0);
@@ -112,7 +140,7 @@ export const agedReceivablesStrategy: TransformStrategy = {
       tenantMap.set(key, existing);
     }
 
-    const normalizedRows = Array.from(tenantMap.values()).map(({ rawName, rawUnit, b0_30, b31_60, b61_90, b90plus }) => {
+    const normalizedRows = Array.from(tenantMap.values()).map(({ rawName, rawUnit, b0_30, b31_60, b61_90, b90plus, tenantStatus }) => {
       const tenantId = normalizeTenantId(rawName, rawUnit);
       const unitId   = normalizeUnitId(rawUnit);
       const totalBalance = b0_30 + b31_60 + b61_90 + b90plus;
@@ -127,6 +155,7 @@ export const agedReceivablesStrategy: TransformStrategy = {
         bucket_90_plus: b90plus,
         dominant_bucket: deriveDominantBucket(b0_30, b31_60, b61_90, b90plus),
         risk_score:     deriveRiskScore(b0_30, b31_60, b61_90, b90plus),
+        tenant_status:  tenantStatus,
       };
     });
 
@@ -194,11 +223,14 @@ export const agedReceivablesStrategy: TransformStrategy = {
         ? row.risk_score
         : deriveRiskScore(b0_30, b31_60, b61_90, b90plus);
 
+      // tenant_status: 'current' | 'past' — from AppFolio TenantStatus field
+      const tenantStatus = String((row as any).tenant_status ?? "current");
+
       const goldRows = await sql<GoldAgedReceivableRecord[]>`
         INSERT INTO gold_aged_receivables
           (bronze_report_id, tenant_id, unit_id,
            total_balance, bucket_0_30, bucket_31_60, bucket_61_90, bucket_90_plus,
-           dominant_bucket, risk_score, created_at)
+           dominant_bucket, risk_score, tenant_status, created_at)
         VALUES (
           ${bronze.id},
           ${tenantId},
@@ -210,6 +242,7 @@ export const agedReceivablesStrategy: TransformStrategy = {
           ${b90plus},
           ${dominantBucket},
           ${riskScore},
+          ${tenantStatus},
           NOW()
         )
         ON CONFLICT (tenant_id, unit_id)
@@ -222,7 +255,8 @@ export const agedReceivablesStrategy: TransformStrategy = {
           bucket_61_90     = EXCLUDED.bucket_61_90,
           bucket_90_plus   = EXCLUDED.bucket_90_plus,
           dominant_bucket  = EXCLUDED.dominant_bucket,
-          risk_score       = EXCLUDED.risk_score
+          risk_score       = EXCLUDED.risk_score,
+          tenant_status    = EXCLUDED.tenant_status
         RETURNING *
       `;
 
