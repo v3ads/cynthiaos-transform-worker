@@ -23,6 +23,10 @@ import { occupancySummaryStrategy }  from "./occupancy_summary";
 import { moveInMoveOutStrategy }     from "./move_in_move_out";
 import { unitDirectoryStrategy }     from "./unit_directory";
 import { unsupportedStrategy }       from "./unsupported";
+import { rentalApplicationsStrategy } from "./rental_applications";
+import { generalLedgerStrategy }      from "./general_ledger";
+import { vendorDirectoryStrategy }    from "./vendor_directory";
+import { guestCardsStrategy }         from "./guest_cards";
 
 // ── Registry ──────────────────────────────────────────────────────────────────
 
@@ -45,9 +49,15 @@ const TRANSFORM_STRATEGIES: Record<string, TransformStrategy> = {
   unit_turn_detail:    unitTurnDetailStrategy,    // canonical AppFolio report type
   move_in_move_out:    moveInMoveOutStrategy,     // legacy — kept for historical Bronze records
 
+  // ── Bronze reports with full Silver + Gold coverage ─────────────────────
+  rental_applications: rentalApplicationsStrategy,  // → gold_rental_applications
+  general_ledger:      generalLedgerStrategy,        // → gold_general_ledger
+  vendor_directory:    vendorDirectoryStrategy,      // → gold_vendors
+  guest_cards:         guestCardsStrategy,           // → gold_prospects
+
   // ── Planned (add handlers here as they are implemented) ──────────────────
   // maintenance_request: maintenanceRequestStrategy,
-  // ... (28 more report types)
+  // ... (24 more report types)
 };
 
 // ── Resolver ──────────────────────────────────────────────────────────────────
