@@ -1,20 +1,30 @@
 // ── Strategy: delinquency ─────────────────────────────────────────────────────
 //
 // Handles the AppFolio Delinquency report type.
-// Silver: normalises rows into { tenant_id, unit_id, balance_due, days_overdue,
-//                                last_payment_date, risk_level, tenant_status }
+// Silver: normalises rows into { tenant_id, unit_id, balance_due, total_outstanding,
+//                                days_overdue, last_payment_date, risk_level, tenant_status }
 // Gold:   promotes each row into gold_delinquency_records with a derived risk_level
+//
+// FIX (2026-04-22): CRITICAL DATA DEFINITION CORRECTION
+//   balance_due was incorrectly set to AmountReceivable (total outstanding balance),
+//   which includes current-month charges not yet overdue and past-tenant carry-overs.
+//   Corrected to use 30Plus (balance aged 30+ days) as the true "overdue" amount.
+//   Added total_outstanding field to store AmountReceivable for reference.
+//
+//   Data definitions:
+//     balance_due       = 30Plus (dollars overdue 30+ days — the actionable collection amount)
+//     total_outstanding = AmountReceivable (total open balance including current charges)
+//
+//   Why this matters:
+//     - AmountReceivable includes this month's rent (not yet overdue) for current tenants
+//     - AmountReceivable includes carry-over balances from past tenants (moved out)
+//     - 30Plus is the correct metric for "how much is actually overdue and collectible"
 //
 // FIX (2026-04-20): Added tenant_status field sourced from AppFolio's TenantStatus
 //   field ('Current' | 'Past'). Past-tenant balances are carry-overs from prior lease
 //   terms and must NOT inflate the current tenant's risk score in unit-intelligence.
 //   The unit-intelligence CTE splits delinquency_balance into current_delinquency_balance
 //   (tenant_status = 'current') and prior_term_balance (tenant_status = 'past').
-//
-// FIX (2026-04-08): Gold promotion now reads `unit_id ?? unit` and
-//   `balance_due ?? total_balance` to handle both the current Silver schema
-//   (which stores `unit` + `total_balance`) and the new schema going forward.
-//   Silver normalization updated to store `unit_id` + `balance_due` consistently.
 //
 // FIX (2026-04-11): days_overdue was incorrectly storing dollar amounts from
 //   AppFolio's aging bucket fields (30Plus, 60Plus, 90Plus are DOLLAR amounts,
@@ -38,7 +48,8 @@ interface GoldDelinquencyRecord {
   bronze_report_id: string | null;
   tenant_id: string;
   unit_id: string;
-  balance_due: string; // NUMERIC returns as string from postgres driver
+  balance_due: string;        // NUMERIC — 30Plus (truly overdue 30+ days)
+  total_outstanding: string;  // NUMERIC — AmountReceivable (total open balance)
   days_overdue: number | null;
   risk_level: string;
   tenant_status: string; // 'current' | 'past' — sourced from AppFolio TenantStatus
@@ -140,9 +151,14 @@ export const delinquencyStrategy: TransformStrategy = {
       // Derive actual calendar days overdue (NOT dollar amounts)
       const daysOverdue = deriveDaysOverdue(r, reportDate);
 
-      // Balance: AppFolio uses AmountReceivable; also support legacy field names
-      const balanceDue = toNum(
-        r.AmountReceivable ?? r.balance_due ?? r.total_balance ?? r.amount_owed ?? r.balance ?? 0
+      // balance_due = 30Plus (truly overdue, 30+ days aged)
+      // This is the actionable collection amount — what is actually past due.
+      const balanceDue = toNum(r["30Plus"] ?? r.balance_due ?? 0);
+
+      // total_outstanding = AmountReceivable (total open balance including current charges)
+      // This includes current-month rent not yet overdue and all aging buckets.
+      const totalOutstanding = toNum(
+        r.AmountReceivable ?? r.total_outstanding ?? r.balance ?? 0
       );
 
       const lastPaymentDate =
@@ -164,6 +180,7 @@ export const delinquencyStrategy: TransformStrategy = {
         tenant_id:         normalizeTenantId(rawName, rawUnit),
         unit_id:           normalizeUnitId(rawUnit),
         balance_due:       balanceDue,
+        total_outstanding: totalOutstanding,
         days_overdue:      daysOverdue,
         last_payment_date: lastPaymentDate,
         risk_level:        deriveRiskLevel(daysOverdue),
@@ -171,7 +188,8 @@ export const delinquencyStrategy: TransformStrategy = {
       };
     });
 
-    const totalBalance = normalizedRows.reduce((acc, r) => acc + r.balance_due, 0);
+    const totalBalanceDue = normalizedRows.reduce((acc, r) => acc + r.balance_due, 0);
+    const totalOutstanding = normalizedRows.reduce((acc, r) => acc + r.total_outstanding, 0);
 
     const normalized_data: Record<string, unknown> = {
       source:           "appfolio",
@@ -183,7 +201,8 @@ export const delinquencyStrategy: TransformStrategy = {
       rows:             normalizedRows,
       summary: {
         total_delinquent_tenants: summary.total_delinquent_tenants ?? normalizedRows.length,
-        total_balance_due:        summary.total_balance_due ?? totalBalance,
+        total_balance_due:        summary.total_balance_due ?? totalBalanceDue,
+        total_outstanding:        totalOutstanding,
         high_risk_count:   normalizedRows.filter((r) => r.risk_level === "high").length,
         medium_risk_count: normalizedRows.filter((r) => r.risk_level === "medium").length,
         low_risk_count:    normalizedRows.filter((r) => r.risk_level === "low").length,
@@ -221,8 +240,13 @@ export const delinquencyStrategy: TransformStrategy = {
       const rawUnit  = String(row.unit_id ?? row.unit ?? "unknown");
       const unitId   = rawUnit === "unknown" ? "unknown" : normalizeUnitId(rawUnit);
 
-      // FIX: Silver may store balance as `balance_due` (new) or `total_balance` (legacy)
-      const balanceDue  = toNum(row.balance_due ?? row.total_balance ?? 0);
+      // balance_due = 30Plus (truly overdue 30+ days)
+      // Legacy Silver records stored AmountReceivable here — correct on re-promotion.
+      const balanceDue = toNum(row.balance_due ?? 0);
+
+      // total_outstanding = AmountReceivable (total open balance)
+      // May be absent in legacy Silver records — default to balanceDue as fallback.
+      const totalOutstanding = toNum(row.total_outstanding ?? row.balance_due ?? 0);
 
       // days_overdue is now a real calendar day count (0–365), never a dollar amount
       const daysOverdue = typeof row.days_overdue === "number" ? row.days_overdue : 0;
@@ -232,15 +256,16 @@ export const delinquencyStrategy: TransformStrategy = {
       const tenantStatus = String((row as any).tenant_status ?? 'current');
 
       // UPSERT on (tenant_id, unit_id) — one delinquency record per tenant+unit.
-      // Conflicting on bronze_report_id caused a new row per daily run.
       const goldRows = await sql<GoldDelinquencyRecord[]>`
         INSERT INTO gold_delinquency_records
-          (bronze_report_id, tenant_id, unit_id, balance_due, days_overdue, risk_level, tenant_status, created_at)
+          (bronze_report_id, tenant_id, unit_id, balance_due, total_outstanding,
+           days_overdue, risk_level, tenant_status, created_at)
         VALUES (
           ${bronze.id},
           ${tenantId},
           ${unitId},
           ${balanceDue},
+          ${totalOutstanding},
           ${daysOverdue},
           ${riskLevel},
           ${tenantStatus},
@@ -248,11 +273,12 @@ export const delinquencyStrategy: TransformStrategy = {
         )
         ON CONFLICT (tenant_id, unit_id)
         DO UPDATE SET
-          bronze_report_id = EXCLUDED.bronze_report_id,
-          balance_due      = EXCLUDED.balance_due,
-          days_overdue     = EXCLUDED.days_overdue,
-          risk_level       = EXCLUDED.risk_level,
-          tenant_status    = EXCLUDED.tenant_status
+          bronze_report_id  = EXCLUDED.bronze_report_id,
+          balance_due       = EXCLUDED.balance_due,
+          total_outstanding = EXCLUDED.total_outstanding,
+          days_overdue      = EXCLUDED.days_overdue,
+          risk_level        = EXCLUDED.risk_level,
+          tenant_status     = EXCLUDED.tenant_status
         RETURNING *
       `;
 
