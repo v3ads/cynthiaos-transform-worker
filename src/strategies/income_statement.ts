@@ -155,10 +155,14 @@ function extractFromRows(rows: Record<string, unknown>[]): IncomeExtract {
     }
   }
 
-  // Use AppFolio summary rows when present; fall back to summed individual rows
-  const ytdTotalIncome   = ytdHasSummary && ytdTotalFromSummary !== 0 ? ytdTotalFromSummary : ytdRental + ytdOther;
+  // IMPORTANT: Do NOT use AppFolio's "Total Income" summary row for total_income.
+  // AppFolio includes Prepaid Rent (account 2300, a liability) in its summary
+  // "Total Income" figure, inflating it by ~$85K. Always derive total_income
+  // by summing 4xxx account rows only (rental_income + other_income).
+  // Use AppFolio's "Total Expenses" summary row for expenses — it is accurate.
+  const ytdTotalIncome   = ytdRental + ytdOther;
   const ytdTotalExpenses = ytdHasSummary && ytdExpenseFromSummary !== 0 ? ytdExpenseFromSummary : ytdExpenses;
-  const mtdTotalIncome   = mtdHasSummary && mtdTotalFromSummary !== 0 ? mtdTotalFromSummary : mtdRental + mtdOther;
+  const mtdTotalIncome   = mtdRental + mtdOther;
   const mtdTotalExpenses = mtdHasSummary && mtdExpenseFromSummary !== 0 ? mtdExpenseFromSummary : mtdExpenses;
 
   return {
