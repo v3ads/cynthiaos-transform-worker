@@ -265,6 +265,20 @@ export const agedReceivablesStrategy: TransformStrategy = {
       }
     }
 
+    // ── Post-promotion correction: sync tenant_status with gold_units ──────────
+    // AppFolio's AR report may lag behind reality — a tenant who has already
+    // vacated may still appear as 'Current' in an old AR export. We correct this
+    // by cross-referencing gold_units: any AR row whose unit is now 'vacant'
+    // must be marked 'past' regardless of what AppFolio's TenantStatus said.
+    await sql`
+      UPDATE gold_aged_receivables ar
+      SET tenant_status = 'past'
+      FROM gold_units gu
+      WHERE ar.unit_id = gu.unit_id
+        AND ar.tenant_status = 'current'
+        AND gu.unit_status = 'vacant'
+    `;
+
     return { gold_ids: goldIds, skipped: false };
   },
 };
