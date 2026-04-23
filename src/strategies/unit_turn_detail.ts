@@ -92,11 +92,13 @@ export const unitTurnDetailStrategy: TransformStrategy = {
         move_out_date:         toDateStr(r.MoveOutDate         ?? r.move_out_date  ?? r.move_out),
         expected_move_in_date: toDateStr(r.ExpectedMoveInDate  ?? r.expected_move_in_date ?? r.move_in_date),
         turn_end_date:         toDateStr(r.TurnEndDate         ?? r.turn_end_date  ?? r.turn_end),
-        days_to_complete:      r.TotalDaysToComplete != null
-          ? toNum(r.TotalDaysToComplete)
-          : r.days_to_complete != null
-          ? toNum(r.days_to_complete)
-          : null,
+        days_to_complete:      (() => {
+          const raw = r.TotalDaysToComplete ?? r.days_to_complete;
+          if (raw == null) return null;
+          const n = toNum(raw);
+          // Negative means AppFolio used expected_move_in_date (future) — turn still in progress
+          return n !== null && n >= 0 ? n : null;
+        })(),
         target_days:           r.TargetDaysToComplete != null
           ? toNum(r.TargetDaysToComplete)
           : r.target_days != null
