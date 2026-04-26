@@ -27,6 +27,7 @@ import { rentalApplicationsStrategy } from "./rental_applications";
 import { generalLedgerStrategy }      from "./general_ledger";
 import { vendorDirectoryStrategy }    from "./vendor_directory";
 import { guestCardsStrategy }         from "./guest_cards";
+import { leaseExpirationDetailStrategy } from "./lease_expiration_detail";
 
 // ── Registry ──────────────────────────────────────────────────────────────────
 
@@ -50,10 +51,11 @@ const TRANSFORM_STRATEGIES: Record<string, TransformStrategy> = {
   move_in_move_out:    moveInMoveOutStrategy,     // legacy — kept for historical Bronze records
 
   // ── Bronze reports with full Silver + Gold coverage ─────────────────────
-  rental_applications: rentalApplicationsStrategy,  // → gold_rental_applications
-  general_ledger:      generalLedgerStrategy,        // → gold_general_ledger
-  vendor_directory:    vendorDirectoryStrategy,      // → gold_vendors
-  guest_cards:         guestCardsStrategy,           // → gold_prospects
+  rental_applications:     rentalApplicationsStrategy,     // → gold_rental_applications
+  general_ledger:          generalLedgerStrategy,          // → gold_general_ledger
+  vendor_directory:        vendorDirectoryStrategy,        // → gold_vendors
+  guest_cards:             guestCardsStrategy,             // → gold_prospects
+  lease_expiration_detail: leaseExpirationDetailStrategy,  // → gold_lease_expirations
 
   // ── Planned (add handlers here as they are implemented) ──────────────────
   // maintenance_request: maintenanceRequestStrategy,
