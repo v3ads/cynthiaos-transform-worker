@@ -252,8 +252,22 @@ export const delinquencyStrategy: TransformStrategy = {
       const daysOverdue = typeof row.days_overdue === "number" ? row.days_overdue : 0;
       const riskLevel   = deriveRiskLevel(daysOverdue);
 
-      // tenant_status: 'current' | 'past' — from AppFolio TenantStatus field
-      const tenantStatus = String((row as any).tenant_status ?? 'current');
+      // tenant_status: 'current' | 'past' — from AppFolio TenantStatus field.
+      // IMPORTANT: AppFolio sometimes marks transferred tenants as 'past' even when
+      // they have an active lease in a new unit. Cross-check gold_tenants: if the
+      // tenant has lease_status = 'active', override to 'current' regardless of
+      // what AppFolio reports. This prevents unit-transfer tenants from being
+      // misclassified as past tenants in the collections-risk panel.
+      let tenantStatus = String((row as any).tenant_status ?? 'current');
+      if (tenantStatus === 'past') {
+        const activeCheck = await sql<{ count: string }[]>`
+          SELECT COUNT(*) AS count FROM gold_tenants
+          WHERE tenant_id = ${tenantId} AND lease_status = 'active'
+        `;
+        if (parseInt(activeCheck[0]?.count ?? '0', 10) > 0) {
+          tenantStatus = 'current';
+        }
+      }
 
       // UPSERT on (tenant_id, unit_id) — one delinquency record per tenant+unit.
       const goldRows = await sql<GoldDelinquencyRecord[]>`
