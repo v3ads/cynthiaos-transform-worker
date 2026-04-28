@@ -36,6 +36,7 @@ interface GoldTenant {
   lease_start_date: Date | null;
   lease_end_date: Date | null;
   lease_status: string | null;
+  is_primary: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -126,6 +127,9 @@ export const tenantDirectoryStrategy: TransformStrategy = {
         phone = cleanPhone(r.phone ?? r.phone_number ?? r.mobile ?? r.cell);
       }
 
+      const isPrimary = String(r.PrimaryTenant ?? r.primary_tenant ?? r.is_primary ?? "No")
+        .trim().toLowerCase() === "yes";
+
       return {
         tenant_id:        normalizeTenantId(fullName, unitId),
         full_name:        fullName,
@@ -135,6 +139,7 @@ export const tenantDirectoryStrategy: TransformStrategy = {
         lease_start_date: toDateStr(r.LeaseFrom ?? r.MoveIn ?? r.lease_start_date ?? r.move_in_date ?? r.start_date),
         lease_end_date:   toDateStr(r.LeaseTo   ?? r.MoveOut ?? r.lease_end_date   ?? r.move_out_date ?? r.end_date),
         lease_status:     normalizeLeaseStatus(r.Status ?? r.TenantStatus ?? r.lease_status ?? r.status ?? r.tenancy_status),
+        is_primary:       isPrimary,
       };
     });
 
@@ -190,13 +195,14 @@ export const tenantDirectoryStrategy: TransformStrategy = {
       const leaseStart     = typeof row.lease_start_date === "string" ? row.lease_start_date : null;
       const leaseEnd       = typeof row.lease_end_date   === "string" ? row.lease_end_date   : null;
       const leaseStatus    = typeof row.lease_status     === "string" ? row.lease_status     : null;
+      const isPrimary      = typeof row.is_primary       === "boolean" ? row.is_primary      : false;
 
       // UPSERT: update all mutable fields if tenant already exists.
       // created_at is preserved on conflict (only updated_at changes).
       const goldRows = await sql<GoldTenant[]>`
         INSERT INTO gold_tenants
           (bronze_report_id, tenant_id, full_name, unit_id,
-           email, phone, lease_start_date, lease_end_date, lease_status,
+           email, phone, lease_start_date, lease_end_date, lease_status, is_primary,
            created_at, updated_at)
         VALUES (
           ${bronze.id},
@@ -208,6 +214,7 @@ export const tenantDirectoryStrategy: TransformStrategy = {
           ${leaseStart}::date,
           ${leaseEnd}::date,
           ${leaseStatus},
+          ${isPrimary},
           NOW(),
           NOW()
         )
@@ -220,6 +227,7 @@ export const tenantDirectoryStrategy: TransformStrategy = {
           lease_start_date = COALESCE(EXCLUDED.lease_start_date, gold_tenants.lease_start_date),
           lease_end_date   = COALESCE(EXCLUDED.lease_end_date,   gold_tenants.lease_end_date),
           lease_status     = EXCLUDED.lease_status,
+          is_primary       = EXCLUDED.is_primary,
           updated_at       = NOW()
         RETURNING *
       `;
