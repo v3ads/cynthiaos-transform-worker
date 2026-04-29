@@ -44,10 +44,15 @@ interface ReportSchema {
   rowLevel?: FieldRule[];
   // Minimum expected row count (warn if below)
   minRows?: number;
+  // Optional predicate: if true, skip this row entirely (no validation)
+  skipRowIf?: (row: Record<string, unknown>) => boolean;
 }
 
 const SCHEMAS: Record<string, ReportSchema> = {
   delinquency: {
+    // Skip subtotal/summary rows (no unit number) — AppFolio includes property-level
+    // aggregate rows in the delinquency report that have no unit or balance.
+    skipRowIf: (row) => !row["unit"] || row["unit"] === "",
     rowLevel: [
       { field: "tenant_id",   required: true,  notEmpty: true, notUnknown: true },
       { field: "unit",        required: true,  notEmpty: true, notUnknown: true },
@@ -64,10 +69,14 @@ const SCHEMAS: Record<string, ReportSchema> = {
     minRows: 1,
   },
   rent_roll: {
+    // Skip vacant unit rows — AppFolio includes vacant units in the rent roll
+    // with null tenant and null rent. These are expected and not anomalies.
+    skipRowIf: (row) => !row["tenant_id"] || row["tenant_id"] === "",
     rowLevel: [
       { field: "tenant_id", required: true, notEmpty: true, notUnknown: true },
       { field: "unit_id",   required: true, notEmpty: true, notUnknown: true },
-      { field: "rent",      required: true, numericPositive: true },
+      // rent can be 0 for some tenants (e.g. staff units) — use numericNonNeg not numericPositive
+      { field: "rent",      required: false, numericNonNeg: true },
     ],
     minRows: 1,
   },
@@ -87,8 +96,9 @@ const SCHEMAS: Record<string, ReportSchema> = {
     minRows: 0,
   },
   unit_vacancy: {
+    // total_units is derived post-validation from gold_units fallback — do not require it here.
+    // Only validate vacant_units which is directly present in the AppFolio report.
     topLevel: [
-      { field: "total_units",  required: true, numericPositive: true },
       { field: "vacant_units", required: true, numericNonNeg: true },
     ],
     minRows: 0,
@@ -201,6 +211,8 @@ export function validateSilver(
   if (schema.rowLevel && rows.length > 0) {
     let rowAnomalyCount = 0;
     for (let i = 0; i < rows.length; i++) {
+      // Skip rows that match the schema's skip predicate (e.g. vacant units, subtotal rows)
+      if (schema.skipRowIf && schema.skipRowIf(rows[i] as Record<string, unknown>)) continue;
       for (const rule of schema.rowLevel) {
         const anomaly = checkRule(rows[i] as Record<string, unknown>, rule, `rows[${i}].`);
         if (anomaly) {
