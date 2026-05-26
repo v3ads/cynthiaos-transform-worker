@@ -27,6 +27,7 @@ import { rentalApplicationsStrategy } from "./rental_applications";
 import { generalLedgerStrategy }      from "./general_ledger";
 import { vendorDirectoryStrategy }    from "./vendor_directory";
 import { guestCardsStrategy }         from "./guest_cards";
+import { workOrderStrategy }          from "./work_order";
 
 // NOTE: lease_expiration_detail is intentionally NOT registered here.
 // gold_lease_expirations is already written by the rent_roll strategy
@@ -60,9 +61,11 @@ const TRANSFORM_STRATEGIES: Record<string, TransformStrategy> = {
   vendor_directory:    vendorDirectoryStrategy,      // → gold_vendors
   guest_cards:         guestCardsStrategy,           // → gold_prospects
 
+  // ── Maintenance ────────────────────────────────────────────────────────────
+  work_order:          workOrderStrategy,             // → gold_maintenance
+
   // ── Planned (add handlers here as they are implemented) ──────────────────
-  // maintenance_request: maintenanceRequestStrategy,
-  // ... (24 more report types)
+  // ... (23 more report types)
 };
 
 // ── Resolver ──────────────────────────────────────────────────────────────────

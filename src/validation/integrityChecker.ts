@@ -101,6 +101,11 @@ const GOLD_TABLES: TableSpec[] = [
     critical: false,   // may be empty if no turns occurred this period
     minRows: 0,
   },
+  {
+    table: "gold_maintenance",
+    critical: true,    // work orders are fetched YTD daily — should always have rows
+    minRows: 50,       // Cynthia Gardens typically has 200+ YTD work orders
+  },
 ];
 
 // ── Main checker ──────────────────────────────────────────────────────────────
