@@ -231,7 +231,16 @@ export const occupancySummaryStrategy: TransformStrategy = {
         ${nd.vacancy_rate},
         ${contentHash}
       )
-      ON CONFLICT (report_date, content_hash) DO NOTHING
+      ON CONFLICT (report_date) 
+      DO UPDATE SET
+        bronze_report_id = EXCLUDED.bronze_report_id,
+        total_units      = EXCLUDED.total_units,
+        occupied_units   = EXCLUDED.occupied_units,
+        vacant_units     = EXCLUDED.vacant_units,
+        occupancy_rate   = EXCLUDED.occupancy_rate,
+        vacancy_rate     = EXCLUDED.vacancy_rate,
+        content_hash     = EXCLUDED.content_hash,
+        promoted_at      = NOW()
       RETURNING id
     `;
 

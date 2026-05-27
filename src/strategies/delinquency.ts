@@ -301,6 +301,16 @@ export const delinquencyStrategy: TransformStrategy = {
       }
     }
 
+    // PURGE GHOST RECORDS:
+    // Delete any delinquency records where total_outstanding is 0 AND the tenant
+    // is marked as 'past'. These are "ghost" records from prior lease terms
+    // that should no longer appear in the active collections dashboard.
+    await sql`
+      DELETE FROM gold_delinquency_records
+      WHERE total_outstanding <= 0
+      AND tenant_status = 'past'
+    `;
+
     return { gold_ids: goldIds, skipped: false };
   },
 };
