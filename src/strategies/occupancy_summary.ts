@@ -211,6 +211,9 @@ export const occupancySummaryStrategy: TransformStrategy = {
       .update(`${nd.report_date}|${nd.total_units}|${nd.occupied_units}|${nd.vacant_units}`)
       .digest("hex");
 
+    // We use ON CONFLICT (report_date) DO UPDATE to ensure daily refreshes.
+    // This resolves staleness issues by updating the snapshot even if the 
+    // content_hash is the same, as long as it's a new daily run.
     const rows = await ctx.sql`
       INSERT INTO gold_occupancy_snapshots (
         bronze_report_id,
@@ -239,8 +242,7 @@ export const occupancySummaryStrategy: TransformStrategy = {
         vacant_units     = EXCLUDED.vacant_units,
         occupancy_rate   = EXCLUDED.occupancy_rate,
         vacancy_rate     = EXCLUDED.vacancy_rate,
-        content_hash     = EXCLUDED.content_hash,
-        promoted_at      = NOW()
+        content_hash     = EXCLUDED.content_hash
       RETURNING id
     `;
 
