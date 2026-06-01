@@ -18,7 +18,7 @@ import {
   logIntegrityReport,
 } from "./validation";
 
-const app = express();
+const app: express.Express = express();
 const PORT = parseInt(process.env.PORT ?? "3002", 10);
 const SERVICE_NAME = "cynthiaos-transform-worker";
 
@@ -258,20 +258,24 @@ app.post("/transform/run", async (_req: Request, res: Response) => {
   try {
     sql = getDb();
 
-    // Find oldest unprocessed bronze record
-    const candidates = await sql<{ bronze_report_id: string; meta_id: string; created_at: Date }[]>`
-      SELECT pm.bronze_report_id, pm.id AS meta_id, pm.created_at
-      FROM pipeline_metadata pm
-      WHERE pm.stage = 'bronze'
-        AND pm.status = 'created'
-        AND pm.bronze_report_id IS NOT NULL
-        AND NOT EXISTS (
-          SELECT 1 FROM silver_appfolio_reports s
-          WHERE s.bronze_report_id = pm.bronze_report_id
-        )
-      ORDER BY pm.created_at ASC
-      LIMIT 1
-    `;
+      // Find oldest Bronze metadata entry that has not yet produced a newer Silver row.
+      // Bronze ingestion is idempotent by (report_type, report_date), so repeated same-day
+      // refreshes reuse the same bronze_report_id. A simple "no Silver exists" check would
+      // incorrectly skip refreshed raw_data; compare timestamps instead.
+      const candidates = await sql<{ bronze_report_id: string; meta_id: string; created_at: Date }[]>`
+        SELECT pm.bronze_report_id, pm.id AS meta_id, pm.created_at
+        FROM pipeline_metadata pm
+        WHERE pm.stage = 'bronze'
+          AND pm.status = 'created'
+          AND pm.bronze_report_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM silver_appfolio_reports s
+            WHERE s.bronze_report_id = pm.bronze_report_id
+              AND s.transformed_at >= pm.created_at
+          )
+        ORDER BY pm.created_at ASC
+        LIMIT 1
+      `;
 
     if (candidates.length === 0) {
       res.status(200).json({
@@ -346,18 +350,22 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
 
     const supportedTypes = getSupportedTypes();
 
-    // Bulk-skip all unsupported Silver records that are still pending Gold promotion
-    await sql`
-      INSERT INTO pipeline_metadata (bronze_report_id, stage, status)
-      SELECT s.bronze_report_id, 'gold', 'skipped'
-      FROM silver_appfolio_reports s
-      WHERE s.report_type != ALL(${supportedTypes})
-        AND NOT EXISTS (
-          SELECT 1 FROM pipeline_metadata pm
-          WHERE pm.bronze_report_id = s.bronze_report_id AND pm.stage = 'gold'
-        )
-      ON CONFLICT DO NOTHING
-    `;
+      // Bulk-skip all unsupported Silver records that are still pending Gold promotion.
+      // Use transformed_at vs. Gold metadata time so a refreshed same-day Bronze row that
+      // reuses the same bronze_report_id is not hidden by an older Gold metadata row.
+      await sql`
+        INSERT INTO pipeline_metadata (bronze_report_id, stage, status)
+        SELECT s.bronze_report_id, 'gold', 'skipped'
+        FROM silver_appfolio_reports s
+        WHERE s.report_type != ALL(${supportedTypes})
+          AND NOT EXISTS (
+            SELECT 1 FROM pipeline_metadata pm
+            WHERE pm.bronze_report_id = s.bronze_report_id
+              AND pm.stage = 'gold'
+              AND pm.created_at >= s.transformed_at
+          )
+        ON CONFLICT DO NOTHING
+      `;
 
     const candidates = await sql<{
       silver_id: string;
@@ -378,6 +386,7 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
           SELECT 1 FROM pipeline_metadata pm
           WHERE pm.bronze_report_id = s.bronze_report_id
             AND pm.stage = 'gold'
+            AND pm.created_at >= s.transformed_at
         )
       ORDER BY s.transformed_at ASC
       LIMIT 1
