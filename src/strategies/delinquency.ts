@@ -34,12 +34,11 @@ function firstNonEmpty(...values: unknown[]): string {
   return "";
 }
 
-function deriveRiskLevel(totalOutstanding: number): "low" | "medium" | "high" | "critical" {
+function deriveRiskLevel(totalOutstanding: number): "low" | "medium" | "high" {
   if (totalOutstanding <= 0) return "low";
   if (totalOutstanding < 500) return "low";
   if (totalOutstanding < 2000) return "medium";
-  if (totalOutstanding < 5000) return "high";
-  return "critical";
+  return "high";
 }
 
 function deriveDaysOverdue(r: Record<string, unknown>): number {
