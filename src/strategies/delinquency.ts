@@ -1,4 +1,3 @@
-// ── delinquency strategy ──────────────────────────────────────────────────────
 //
 // Handles the AppFolio "Delinquency" report.
 // Normalises delinquency amounts and derives risk levels.
@@ -26,12 +25,38 @@ function toNum(v: unknown): number {
   return isNaN(n) ? 0 : n;
 }
 
+function firstNonEmpty(...values: unknown[]): string {
+  for (const value of values) {
+    if (value == null) continue;
+    const text = String(value).trim();
+    if (text !== "") return text;
+  }
+  return "";
+}
+
 function deriveRiskLevel(totalOutstanding: number): "low" | "medium" | "high" | "critical" {
   if (totalOutstanding <= 0) return "low";
   if (totalOutstanding < 500) return "low";
   if (totalOutstanding < 2000) return "medium";
   if (totalOutstanding < 5000) return "high";
   return "critical";
+}
+
+function deriveDaysOverdue(r: Record<string, unknown>): number {
+  const explicit = parseInt(String(r.DaysOverdue ?? r.days_overdue ?? ""), 10);
+  if (!Number.isNaN(explicit)) return Math.max(0, explicit);
+
+  // AppFolio Delinquency rows provide aging buckets rather than a single days-overdue field.
+  if (toNum(r["90Plus"] ?? r["90_plus"] ?? r.over_90) > 0) return 90;
+  if (toNum(r["60Plus"] ?? r["60_plus"]) > 0 || toNum(r["60To90"] ?? r["61_90"] ?? r.days_61_90) > 0) return 60;
+  if (toNum(r["30Plus"] ?? r["30_plus"]) > 0 || toNum(r["30To60"] ?? r["31_60"] ?? r.days_31_60) > 0) return 30;
+  if (toNum(r["0To30"] ?? r["0_30"] ?? r.current) > 0) return 1;
+  return 0;
+}
+
+function normalizeTenantStatus(value: unknown): "current" | "past" {
+  const status = String(value ?? "Current").trim().toLowerCase();
+  return status === "past" ? "past" : "current";
 }
 
 // ── Strategy ──────────────────────────────────────────────────────────────────
@@ -48,19 +73,50 @@ export const delinquencyStrategy: TransformStrategy = {
       : [];
 
     const normalizedRows = rows.map((r) => {
-      const balanceDue = toNum(r.BalanceDue ?? r.balance_due);
-      const totalOutstanding = toNum(r.TotalOutstanding ?? r.total_outstanding);
-      const tenantName = String(r.TenantName ?? r.tenant_name ?? "");
-      const unitName = String(r.UnitName ?? r.unit_name ?? "");
+      // Live AppFolio delinquency uses Name/Unit/DelinquentRent/AmountReceivable.
+      // Keep legacy aliases so older Bronze payloads can still be reprocessed safely.
+      const tenantName = firstNonEmpty(
+        r.TenantName,
+        r.tenant_name,
+        r.tenant,
+        r.Name,
+        r.name,
+        r.PayerName,
+        r.resident
+      );
+      const unitName = firstNonEmpty(
+        r.UnitName,
+        r.unit_name,
+        r.unit,
+        r.Unit,
+        r.unit_id,
+        r.unit_number
+      );
+      const balanceDue = toNum(
+        r.BalanceDue ??
+        r.balance_due ??
+        r.DelinquentRent ??
+        r.delinquent_rent ??
+        r.AmountReceivable ??
+        r.amount_receivable
+      );
+      const totalOutstanding = toNum(
+        r.TotalOutstanding ??
+        r.total_outstanding ??
+        r.AmountReceivable ??
+        r.amount_receivable ??
+        r.DelinquentRent ??
+        r.delinquent_rent
+      );
 
       return {
         tenant_id: normalizeTenantId(tenantName),
         unit_id: normalizeUnitId(unitName),
         balance_due: balanceDue,
         total_outstanding: totalOutstanding,
-        days_overdue: Math.max(0, parseInt(String(r.DaysOverdue ?? r.days_overdue ?? 0), 10)),
+        days_overdue: deriveDaysOverdue(r),
         risk_level: deriveRiskLevel(totalOutstanding),
-        tenant_status: String(r.TenantStatus ?? r.tenant_status ?? "current").toLowerCase(),
+        tenant_status: normalizeTenantStatus(r.TenantStatus ?? r.tenant_status),
       };
     });
 
@@ -84,15 +140,22 @@ export const delinquencyStrategy: TransformStrategy = {
     }
 
     const goldIds: string[] = [];
+    let skippedSentinelRows = 0;
 
     for (const row of rows) {
-      const tenantId = row.tenant_id as string;
-      const unitId = row.unit_id as string;
-      const balanceDue = row.balance_due as number;
-      const totalOutstanding = row.total_outstanding as number;
-      const daysOverdue = row.days_overdue as number;
-      const riskLevel = row.risk_level as string;
-      const tenantStatus = row.tenant_status as string;
+      const tenantId = String(row.tenant_id ?? "unknown");
+      const unitId = String(row.unit_id ?? row.unit ?? "unknown");
+      const balanceDue = toNum(row.balance_due);
+      const totalOutstanding = toNum(row.total_outstanding);
+      const daysOverdue = Math.max(0, parseInt(String(row.days_overdue ?? 0), 10) || 0);
+      const riskLevel = String(row.risk_level ?? deriveRiskLevel(totalOutstanding));
+      const tenantStatus = normalizeTenantStatus(row.tenant_status);
+
+      // Never write sentinel identity rows into Gold; they break joins and integrity checks.
+      if (tenantId === "unknown" || unitId === "unknown") {
+        skippedSentinelRows += 1;
+        continue;
+      }
 
       // UPSERT on unit_id — only one delinquency record per unit.
       // This handles tenant ID variants (e.g., "powell_wonson" vs "powellwonson")
@@ -130,8 +193,14 @@ export const delinquencyStrategy: TransformStrategy = {
       }
     }
 
+    // Remove stale sentinel rows left by prior bad mappings.
+    await sql`
+      DELETE FROM gold_delinquency_records
+      WHERE tenant_id = 'unknown' OR unit_id = 'unknown'
+    `;
+
     // PURGE GHOST/PAST RECORDS:
-    // Delete delinquency records where tenant_status = 'past' IF there is 
+    // Delete delinquency records where tenant_status = 'past' IF there is
     // a 'current' tenant record for the same unit.
     await sql`
       DELETE FROM gold_delinquency_records g1
@@ -149,6 +218,10 @@ export const delinquencyStrategy: TransformStrategy = {
       WHERE tenant_status = 'past' AND total_outstanding <= 0
     `;
 
-    return { gold_ids: goldIds, skipped: false };
+    return {
+      gold_ids: goldIds,
+      skipped: false,
+      ...(skippedSentinelRows > 0 ? { warnings: [`Skipped ${skippedSentinelRows} delinquency row(s) with unresolved tenant_id or unit_id`] } : {}),
+    } as GoldPromoteResult;
   },
 };

@@ -50,13 +50,11 @@ interface ReportSchema {
 
 const SCHEMAS: Record<string, ReportSchema> = {
   delinquency: {
-    // Skip subtotal/summary rows (no unit number) — AppFolio includes property-level
-    // aggregate rows in the delinquency report that have no unit or balance.
-    skipRowIf: (row) => !row["unit"] || row["unit"] === "",
     rowLevel: [
-      { field: "tenant_id",   required: true,  notEmpty: true, notUnknown: true },
-      { field: "unit",        required: true,  notEmpty: true, notUnknown: true },
-      { field: "total_balance", required: true, numericNonNeg: true },
+      { field: "tenant_id",         required: true, notEmpty: true, notUnknown: true },
+      { field: "unit_id",           required: true, notEmpty: true, notUnknown: true },
+      { field: "balance_due",       required: true, numericNonNeg: true },
+      { field: "total_outstanding", required: true, numericNonNeg: true },
     ],
     minRows: 1,
   },
