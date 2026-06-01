@@ -253,35 +253,57 @@ app.post("/transform/test", async (req: Request, res: Response) => {
 });
 
 // ── POST /transform/run ─────────────────────────────────────────────────────
-app.post("/transform/run", async (_req: Request, res: Response) => {
+app.post("/transform/run", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
 
-      // Find oldest Bronze metadata entry that has not yet produced a newer Silver row.
-      // Bronze ingestion is idempotent by (report_type, report_date), so repeated same-day
-      // refreshes reuse the same bronze_report_id. A simple "no Silver exists" check would
-      // incorrectly skip refreshed raw_data; compare timestamps instead.
-      const candidates = await sql<{ bronze_report_id: string; meta_id: string; created_at: Date }[]>`
-        SELECT pm.bronze_report_id, pm.id AS meta_id, pm.created_at
-        FROM pipeline_metadata pm
-        WHERE pm.stage = 'bronze'
-          AND pm.status = 'created'
-          AND pm.bronze_report_id IS NOT NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM silver_appfolio_reports s
-            WHERE s.bronze_report_id = pm.bronze_report_id
-              AND s.transformed_at >= pm.created_at
-          )
-        ORDER BY pm.created_at ASC
-        LIMIT 1
-      `;
+    const requestedBronzeId =
+      typeof req.body?.bronze_report_id === "string"
+        ? req.body.bronze_report_id
+        : typeof req.query.bronze_id === "string"
+          ? req.query.bronze_id
+          : undefined;
+    const requestedReportType =
+      typeof req.body?.report_type === "string"
+        ? req.body.report_type
+        : typeof req.query.report_type === "string"
+          ? req.query.report_type
+          : undefined;
+
+    // Find a Bronze metadata entry that has not yet produced a newer Silver row.
+    // Repeated same-day AppFolio refreshes upsert the Bronze row, so the queue must
+    // compare stage timestamps rather than only testing whether any Silver row exists.
+    // The join to bronze_appfolio_reports prevents stale orphan metadata from blocking
+    // the whole queue, and explicit bronze_report_id/report_type requests let ingestion
+    // process the report it just wrote instead of draining unrelated historical backlog.
+    const candidates = await sql<{ bronze_report_id: string; meta_id: string; created_at: Date }[]>`
+      SELECT pm.bronze_report_id, pm.id AS meta_id, pm.created_at
+      FROM pipeline_metadata pm
+      JOIN bronze_appfolio_reports b ON b.id = pm.bronze_report_id
+      WHERE pm.stage = 'bronze'
+        AND pm.status = 'created'
+        AND pm.bronze_report_id IS NOT NULL
+        AND (${requestedBronzeId ?? null}::uuid IS NULL OR pm.bronze_report_id = ${requestedBronzeId ?? null}::uuid)
+        AND (${requestedReportType ?? null}::text IS NULL OR b.report_type = ${requestedReportType ?? null})
+        AND NOT EXISTS (
+          SELECT 1 FROM silver_appfolio_reports s
+          WHERE s.bronze_report_id = pm.bronze_report_id
+            AND s.transformed_at >= pm.created_at
+        )
+      ORDER BY
+        CASE WHEN ${requestedBronzeId ?? null}::uuid IS NOT NULL THEN pm.created_at END DESC,
+        pm.created_at ASC
+      LIMIT 1
+    `;
 
     if (candidates.length === 0) {
       res.status(200).json({
         success: true,
         processed: false,
-        message: "No unprocessed bronze records found",
+        message: requestedBronzeId || requestedReportType
+          ? "No matching unprocessed bronze records found"
+          : "No unprocessed bronze records found",
       });
       return;
     }
@@ -291,13 +313,18 @@ app.post("/transform/run", async (_req: Request, res: Response) => {
 
     const { bronze, silver, meta } = await transformBronzeReport(sql, bronze_report_id);
 
-    // Mark the bronze pipeline_metadata record as 'processed'
-    await sql`
+    // Mark all older created Bronze metadata for this report as processed once a newer
+    // Silver row exists, preventing duplicate same-day metadata from re-queuing forever.
+    const markedRows = await sql<{ id: string }[]>`
       UPDATE pipeline_metadata
       SET status = 'processed', updated_at = NOW()
-      WHERE id = ${meta_id}
+      WHERE stage = 'bronze'
+        AND status = 'created'
+        AND bronze_report_id = ${bronze_report_id}
+        AND created_at <= ${silver.transformed_at}
+      RETURNING id
     `;
-    console.log(`[${SERVICE_NAME}] POST /transform/run — marked bronze meta ${meta_id} as processed`);
+    console.log(`[${SERVICE_NAME}] POST /transform/run — marked ${markedRows.length} bronze metadata rows processed; selected_meta=${meta_id}`);
 
     // Auto-trigger Gold promotion (fire-and-forget)
     triggerGold().catch(() => { /* already logged inside triggerGold */ });
