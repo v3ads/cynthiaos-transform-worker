@@ -58,6 +58,12 @@ function normalizeTenantStatus(value: unknown): "current" | "past" {
   return status === "past" ? "past" : "current";
 }
 
+function normalizeRiskLevel(value: unknown, totalOutstanding: number): "low" | "medium" | "high" {
+  const riskLevel = String(value ?? "").trim().toLowerCase();
+  if (riskLevel === "low" || riskLevel === "medium" || riskLevel === "high") return riskLevel;
+  return deriveRiskLevel(totalOutstanding);
+}
+
 // ── Strategy ──────────────────────────────────────────────────────────────────
 
 export const delinquencyStrategy: TransformStrategy = {
@@ -147,7 +153,7 @@ export const delinquencyStrategy: TransformStrategy = {
       const balanceDue = toNum(row.balance_due);
       const totalOutstanding = toNum(row.total_outstanding);
       const daysOverdue = Math.max(0, parseInt(String(row.days_overdue ?? 0), 10) || 0);
-      const riskLevel = String(row.risk_level ?? deriveRiskLevel(totalOutstanding));
+      const riskLevel = normalizeRiskLevel(row.risk_level, totalOutstanding);
       const tenantStatus = normalizeTenantStatus(row.tenant_status);
 
       // Never write sentinel identity rows into Gold; they break joins and integrity checks.
