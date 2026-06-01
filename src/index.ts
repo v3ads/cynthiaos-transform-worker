@@ -114,13 +114,22 @@ function deriveReportDate(bronze: BronzeAppfolioReport): string | null {
 
 async function transformBronzeReport(
   sql: postgres.Sql,
-  bronzeId?: string
+  bronzeId?: string,
+  reportType?: string
 ): Promise<{ bronze: BronzeAppfolioReport; silver: SilverAppfolioReport; meta: PipelineMetadata }> {
   let bronzeRows: BronzeAppfolioReport[];
 
   if (bronzeId) {
     bronzeRows = await sql<BronzeAppfolioReport[]>`
       SELECT * FROM bronze_appfolio_reports WHERE id = ${bronzeId} LIMIT 1
+    `;
+  } else if (reportType) {
+    bronzeRows = await sql<BronzeAppfolioReport[]>`
+      SELECT *
+      FROM bronze_appfolio_reports
+      WHERE report_type = ${reportType}
+      ORDER BY report_date DESC, ingested_at DESC
+      LIMIT 1
     `;
   } else {
     bronzeRows = await sql<BronzeAppfolioReport[]>`
@@ -201,11 +210,13 @@ async function triggerGold(): Promise<void> {
 }
 
 // ── POST /transform/test ──────────────────────────────────────────────────────
-app.post("/transform/test", async (_req: Request, res: Response) => {
+app.post("/transform/test", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const { bronze, silver, meta } = await transformBronzeReport(sql);
+    const bronzeId = typeof req.query.bronze_id === "string" ? req.query.bronze_id : undefined;
+    const reportType = typeof req.query.report_type === "string" ? req.query.report_type : undefined;
+    const { bronze, silver, meta } = await transformBronzeReport(sql, bronzeId, reportType);
 
     res.status(200).json({
       success: true,
