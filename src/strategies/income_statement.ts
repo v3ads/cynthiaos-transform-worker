@@ -331,9 +331,8 @@ export const incomeStatementStrategy: TransformStrategy = {
         ${contentHash},
         NOW()
       )
-      ON CONFLICT (report_date, content_hash)
-      DO UPDATE SET
-        bronze_report_id          = EXCLUDED.bronze_report_id,
+      ON CONFLICT (bronze_report_id) DO UPDATE SET
+        report_date               = EXCLUDED.report_date,
         total_income              = EXCLUDED.total_income,
         rental_income             = EXCLUDED.rental_income,
         other_income              = EXCLUDED.other_income,
@@ -346,7 +345,8 @@ export const incomeStatementStrategy: TransformStrategy = {
         other_income_mtd          = EXCLUDED.other_income_mtd,
         total_expenses_mtd        = EXCLUDED.total_expenses_mtd,
         operating_expenses_mtd    = EXCLUDED.operating_expenses_mtd,
-        net_operating_income_mtd  = EXCLUDED.net_operating_income_mtd
+        net_operating_income_mtd  = EXCLUDED.net_operating_income_mtd,
+        content_hash              = EXCLUDED.content_hash
       RETURNING *
     `;
 
