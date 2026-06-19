@@ -245,10 +245,8 @@ export const agedReceivablesStrategy: TransformStrategy = {
           ${tenantStatus},
           NOW()
         )
-        ON CONFLICT (tenant_id, unit_id)
+        ON CONFLICT (bronze_report_id, tenant_id, unit_id)
         DO UPDATE SET
-          bronze_report_id = EXCLUDED.bronze_report_id,
-          unit_id          = EXCLUDED.unit_id,
           total_balance    = EXCLUDED.total_balance,
           bucket_0_30      = EXCLUDED.bucket_0_30,
           bucket_31_60     = EXCLUDED.bucket_31_60,
