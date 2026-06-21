@@ -40,8 +40,9 @@ const TRANSFORM_STRATEGIES: Record<string, TransformStrategy> = {
   // ── Implemented ──────────────────────────────────────────────────────────
   rent_roll:          rentRollStrategy,
   delinquency:        delinquencyStrategy,
-  aged_receivables:    agedReceivablesStrategy,
-  tenant_directory:    tenantDirectoryStrategy,
+  aged_receivables:        agedReceivablesStrategy,
+  aged_receivables_detail: agedReceivablesStrategy,  // AppFolio fetch-type alias → same strategy
+  tenant_directory:        tenantDirectoryStrategy,
   income_statement:    incomeStatementStrategy,
 
   // ── Unit Directory (canonical unit source) ────────────────────────────────────
