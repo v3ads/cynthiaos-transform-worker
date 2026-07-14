@@ -263,6 +263,62 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
     checks.push(queryFailure("lease_expiration_reconciliation", "gold_lease_expirations", err));
   }
 
+  // Lease scope reconciliation (added 2026-07-14). The API serves every lease
+  // population from the v_lease_population canonical view (created by the API
+  // at startup); this check queries the SAME view with the SAME scope
+  // predicates the endpoints use, so any drift between the view, the base
+  // table, and the scope definitions surfaces on Status instead of as a
+  // silent count mismatch on a page. Invariants:
+  //   1. view row count == gold_lease_expirations row count (pass-through)
+  //   2. active_future == sum of its urgency buckets (0-30 / 31-60 / later)
+  //   3. active_future has exactly one row per unit
+  //   4. risk == expired part + future ≤90d part (mutually exclusive split)
+  // If the view is missing (e.g. API startup never ran against this DB), the
+  // check fails with undefined_table — that is a genuine failure, since every
+  // lease endpoint would be failing too.
+  try {
+    const rows = await sql<{
+      table_total: string; view_total: string;
+      active_future: string; af_units: string;
+      af_0_30: string; af_31_60: string; af_later: string;
+      family_held: string;
+      risk_total: string; risk_expired: string; risk_future: string;
+    }[]>`
+      SELECT
+        (SELECT COUNT(*)::text FROM gold_lease_expirations) AS table_total,
+        COUNT(*)::text AS view_total,
+        COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held)::text AS active_future,
+        COUNT(DISTINCT unit_id) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held)::text AS af_units,
+        COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held AND days_until_expiration <= 30)::text AS af_0_30,
+        COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held AND days_until_expiration BETWEEN 31 AND 60)::text AS af_31_60,
+        COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held AND days_until_expiration > 60)::text AS af_later,
+        COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND is_family_held)::text AS family_held,
+        COUNT(*) FILTER (WHERE is_soonest_for_unit AND NOT has_active_future_tenant_lease AND NOT is_released AND days_until_expiration <= 90)::text AS risk_total,
+        COUNT(*) FILTER (WHERE is_soonest_for_unit AND NOT has_active_future_tenant_lease AND NOT is_released AND days_until_expiration < 0)::text AS risk_expired,
+        COUNT(*) FILTER (WHERE is_soonest_for_unit AND NOT has_active_future_tenant_lease AND NOT is_released AND days_until_expiration BETWEEN 0 AND 90)::text AS risk_future
+      FROM v_lease_population
+    `;
+    const r = rows[0];
+    const n = (v: string | undefined) => Number(v ?? 0);
+    const bucketSum = n(r?.af_0_30) + n(r?.af_31_60) + n(r?.af_later);
+    const riskSum = n(r?.risk_expired) + n(r?.risk_future);
+    const passed =
+      n(r?.view_total) === n(r?.table_total) &&
+      n(r?.active_future) === bucketSum &&
+      n(r?.active_future) === n(r?.af_units) &&
+      n(r?.risk_total) === riskSum;
+    checks.push({
+      check: "lease_scope_reconciliation",
+      table: "v_lease_population (canonical lease scopes)",
+      passed,
+      detail: `view=${r?.view_total ?? 0} vs table=${r?.table_total ?? 0}; active_future=${r?.active_future ?? 0} (units=${r?.af_units ?? 0}, buckets ${r?.af_0_30 ?? 0}+${r?.af_31_60 ?? 0}+${r?.af_later ?? 0}=${bucketSum}); family_held=${r?.family_held ?? 0}; risk=${r?.risk_total ?? 0} (expired ${r?.risk_expired ?? 0} + future≤90 ${r?.risk_future ?? 0} = ${riskSum})`,
+      actual: n(r?.active_future),
+      expected: String(bucketSum),
+    });
+  } catch (err) {
+    checks.push(queryFailure("lease_scope_reconciliation", "v_lease_population (canonical lease scopes)", err));
+  }
+
   // Turn snapshots must represent one physical event per canonical unit/date. Future
   // move-outs are allowed only as scheduled events at the API layer and are reported.
   try {
