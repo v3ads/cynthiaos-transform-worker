@@ -249,6 +249,35 @@ export const unitTurnDetailStrategy: TransformStrategy = {
         AND bronze_report_id IS DISTINCT FROM ${bronze.id}
     `;
 
+    // PostgreSQL UNIQUE constraints treat NULL values as distinct, so repeatedly
+    // promoting the same Bronze report used to append duplicate undated events.
+    // Collapse only exact physical signatures; different expected dates, end dates,
+    // durations, targets, or billed amounts remain separate legitimate events.
+    await sql`
+      WITH ranked AS (
+        SELECT id,
+               ROW_NUMBER() OVER (
+                 PARTITION BY bronze_report_id,
+                              event_type,
+                              unit_id,
+                              COALESCE(move_out_date::text, ''),
+                              COALESCE(expected_move_in_date::text, ''),
+                              COALESCE(turn_end_date::text, ''),
+                              COALESCE(days_to_complete::text, ''),
+                              COALESCE(target_days::text, ''),
+                              COALESCE(total_billed::text, '')
+                 ORDER BY created_at DESC, id DESC
+               ) AS duplicate_rank
+        FROM gold_unit_turnover
+        WHERE event_type = 'turn'
+          AND bronze_report_id = ${bronze.id}
+      )
+      DELETE FROM gold_unit_turnover g
+      USING ranked r
+      WHERE g.id = r.id
+        AND r.duplicate_rank > 1
+    `;
+
     return { gold_ids: goldIds, skipped: false };
   },
 };

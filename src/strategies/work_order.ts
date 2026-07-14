@@ -317,6 +317,33 @@ export const workOrderStrategy: TransformStrategy = {
       }
     }
 
+    // The AppFolio work-order extract is a complete current YTD snapshot. Gold
+    // previously only upserted, so work orders absent from newer snapshots were
+    // retained indefinitely (452 Gold rows versus 309 current source IDs).
+    // Remove stale rows only after every source row has promoted successfully and
+    // only when the incoming snapshot is large enough to be plausibly complete.
+    const currentGoldCountRows = await sql<{ count: string }[]>`
+      SELECT COUNT(*)::text AS count FROM gold_maintenance
+    `;
+    const currentGoldCount = Number(currentGoldCountRows[0]?.count ?? 0);
+    const uniqueSourceCount = new Set(
+      rows.map((row) => toInt(row.work_order_id)).filter((id): id is number => id !== null)
+    ).size;
+    const snapshotLooksComplete = uniqueSourceCount >= 100 &&
+      (currentGoldCount === 0 || uniqueSourceCount >= Math.floor(currentGoldCount * 0.5));
+
+    if (snapshotLooksComplete && goldIds.length === uniqueSourceCount) {
+      await sql`
+        DELETE FROM gold_maintenance
+        WHERE bronze_report_id IS DISTINCT FROM ${bronze.id}
+      `;
+    } else {
+      console.warn(
+        `[work_order] Skipping stale-row cleanup: source=${uniqueSourceCount}, ` +
+        `promoted=${goldIds.length}, existing_gold=${currentGoldCount}`
+      );
+    }
+
     return { gold_ids: goldIds, skipped: false };
   },
 };
