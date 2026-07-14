@@ -54,6 +54,17 @@ function toDateStr(val: unknown): string | null {
 
 // ── Gold row interface ────────────────────────────────────────────────────────
 
+interface NormalizedUnitTurn {
+  unit_id: string;
+  move_out_date: string | null;
+  expected_move_in_date: string | null;
+  turn_end_date: string | null;
+  days_to_complete: number | null;
+  target_days: number | null;
+  total_billed: number;
+  status: "scheduled" | "in_progress" | "completed";
+}
+
 interface GoldUnitTurnover {
   id: string;
   bronze_report_id: string | null;
@@ -83,32 +94,57 @@ export const unitTurnDetailStrategy: TransformStrategy = {
       ? (raw.rows as Record<string, unknown>[])
       : [];
 
-    const normalizedRows = rows.map((r) => {
-      // AppFolio PascalCase fields; also support legacy snake_case
-      const rawUnit = String(r.Unit ?? r.unit ?? r.unit_id ?? r.unit_number ?? "");
+    const reportDate = toDateStr(ctx.bronze.report_date) ?? new Date().toISOString().slice(0, 10);
+    const eventMap = new Map<string, NormalizedUnitTurn>();
 
-      return {
-        unit_id:               normalizeUnitId(rawUnit),
-        move_out_date:         toDateStr(r.MoveOutDate         ?? r.move_out_date  ?? r.move_out),
-        expected_move_in_date: toDateStr(r.ExpectedMoveInDate  ?? r.expected_move_in_date ?? r.move_in_date),
-        turn_end_date:         toDateStr(r.TurnEndDate         ?? r.turn_end_date  ?? r.turn_end),
-        days_to_complete:      (() => {
-          const raw = r.TotalDaysToComplete ?? r.days_to_complete;
-          if (raw == null) return null;
-          const n = toNum(raw);
-          // Negative means AppFolio used expected_move_in_date (future) — turn still in progress
-          return n !== null && n >= 0 ? n : null;
-        })(),
-        target_days:           r.TargetDaysToComplete != null
-          ? toNum(r.TargetDaysToComplete)
-          : r.target_days != null
-          ? toNum(r.target_days)
-          : null,
-        total_billed:          toNum(
-          r.TotalBilled ?? r.BillablesFromWorkOrders ?? r.total_billed ?? r.billed ?? 0
-        ),
-      };
-    });
+    for (const r of rows) {
+      // AppFolio PascalCase fields; also support legacy snake_case.
+      const rawUnit = String(r.Unit ?? r.unit ?? r.unit_id ?? r.unit_number ?? "");
+      const unitId = normalizeUnitId(rawUnit);
+      const moveOutDate = toDateStr(r.MoveOutDate ?? r.move_out_date ?? r.move_out);
+      const expectedMoveInDate = toDateStr(
+        r.ExpectedMoveInDate ?? r.expected_move_in_date ?? r.move_in_date
+      );
+      const turnEndDate = toDateStr(r.TurnEndDate ?? r.turn_end_date ?? r.turn_end);
+      const rawDays = r.TotalDaysToComplete ?? r.days_to_complete;
+      const parsedDays = rawDays == null ? null : toNum(rawDays);
+      const daysToComplete = parsedDays !== null && parsedDays >= 0 ? parsedDays : null;
+      const targetDays = r.TargetDaysToComplete != null
+        ? toNum(r.TargetDaysToComplete)
+        : r.target_days != null
+        ? toNum(r.target_days)
+        : null;
+      const totalBilled = toNum(
+        r.TotalBilled ?? r.BillablesFromWorkOrders ?? r.total_billed ?? r.billed ?? 0
+      );
+      const status = moveOutDate && moveOutDate > reportDate
+        ? "scheduled"
+        : turnEndDate && turnEndDate <= reportDate
+        ? "completed"
+        : "in_progress";
+
+      // The source repeats identical physical events across report chunks and
+      // daily snapshots. Keep one canonical row per full event signature.
+      const eventKey = [
+        unitId,
+        moveOutDate ?? "",
+        expectedMoveInDate ?? "",
+        turnEndDate ?? "",
+        daysToComplete ?? "",
+      ].join("|");
+      eventMap.set(eventKey, {
+        unit_id: unitId,
+        move_out_date: moveOutDate,
+        expected_move_in_date: expectedMoveInDate,
+        turn_end_date: turnEndDate,
+        days_to_complete: daysToComplete,
+        target_days: targetDays,
+        total_billed: totalBilled,
+        status,
+      });
+    }
+
+    const normalizedRows = Array.from(eventMap.values());
 
     return {
       normalized_data: {
@@ -117,7 +153,9 @@ export const unitTurnDetailStrategy: TransformStrategy = {
         report_date:      ctx.bronze.report_date,
         bronze_report_id: ctx.bronze.id,
         transformed_at:   new Date().toISOString(),
+        source_row_count: rows.length,
         row_count:        normalizedRows.length,
+        duplicate_rows_removed: rows.length - normalizedRows.length,
         rows:             normalizedRows,
         summary: {
           total_turns:          normalizedRows.length,
@@ -153,7 +191,7 @@ export const unitTurnDetailStrategy: TransformStrategy = {
     const goldIds: string[] = [];
 
     for (const row of rows) {
-      const unitId             = String(row.unit_id ?? "unknown");
+      const unitId             = normalizeUnitId(row.unit_id ?? "unknown");
       const moveOutDate        = row.move_out_date         as string | null ?? null;
       const expectedMoveInDate = row.expected_move_in_date as string | null ?? null;
       const turnEndDate        = row.turn_end_date         as string | null ?? null;
@@ -185,7 +223,7 @@ export const unitTurnDetailStrategy: TransformStrategy = {
           ${totalBilled},
           NOW()
         )
-        ON CONFLICT (unit_id, move_out_date)
+        ON CONFLICT (bronze_report_id, unit_id, move_out_date)
         DO UPDATE SET
           bronze_report_id      = EXCLUDED.bronze_report_id,
           expected_move_in_date = EXCLUDED.expected_move_in_date,
@@ -200,6 +238,16 @@ export const unitTurnDetailStrategy: TransformStrategy = {
         goldIds.push(inserted[0].id);
       }
     }
+
+    // AppFolio's unit-turn report is a complete YTD snapshot. Previous code
+    // accumulated every daily snapshot, producing hundreds of repeated physical
+    // events. Delete prior `turn` snapshots only after the full current report
+    // has been promoted; move-in/move-out event rows are separate and preserved.
+    await sql`
+      DELETE FROM gold_unit_turnover
+      WHERE event_type = 'turn'
+        AND bronze_report_id <> ${bronze.id}
+    `;
 
     return { gold_ids: goldIds, skipped: false };
   },

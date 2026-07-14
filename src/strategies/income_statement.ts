@@ -97,6 +97,12 @@ function deriveProfitMargin(noi: number, totalIncome: number): number | null {
 interface IncomeExtract {
   ytd: { totalIncome: number; rentalIncome: number; otherIncome: number; totalExpenses: number; operatingExpenses: number; noi: number; };
   mtd: { totalIncome: number; rentalIncome: number; otherIncome: number; totalExpenses: number; operatingExpenses: number; noi: number; };
+  diagnostics: {
+    source_row_count: number;
+    income_account_count: number;
+    expense_account_count: number;
+    expense_source: "summary" | "account_sum";
+  };
 }
 
 function extractFromRows(rows: Record<string, unknown>[]): IncomeExtract {
@@ -107,6 +113,7 @@ function extractFromRows(rows: Record<string, unknown>[]): IncomeExtract {
   // Accumulators for MTD
   let mtdRental = 0, mtdOther = 0, mtdExpenses = 0;
   let mtdTotalFromSummary = 0, mtdExpenseFromSummary = 0, mtdHasSummary = false;
+  let incomeAccountCount = 0, expenseAccountCount = 0;
 
   const parseAmt = (val: unknown): number =>
     toNum(String(val ?? "0").replace(/,/g, ""));
@@ -125,7 +132,7 @@ function extractFromRows(rows: Record<string, unknown>[]): IncomeExtract {
         ytdTotalFromSummary = ytd;
         mtdTotalFromSummary = mtd;
         ytdHasSummary = mtdHasSummary = true;
-      } else if (nameLower === "total expense" || nameLower === "total expenses") {
+      } else if (nameLower.includes("total") && nameLower.includes("expense")) {
         ytdExpenseFromSummary = Math.abs(ytd);
         mtdExpenseFromSummary = Math.abs(mtd);
         ytdHasSummary = mtdHasSummary = true;
@@ -139,6 +146,7 @@ function extractFromRows(rows: Record<string, unknown>[]): IncomeExtract {
 
     if (acctInt >= 4000 && acctInt < 5000) {
       // Income accounts (4xxx)
+      incomeAccountCount += 1;
       if (acctInt === 4530 || (nameLower.includes("rent") && !nameLower.includes("expense"))) {
         // Primary Rent account
         ytdRental += ytd;
@@ -148,8 +156,11 @@ function extractFromRows(rows: Record<string, unknown>[]): IncomeExtract {
         ytdOther += ytd;
         mtdOther += mtd;
       }
-    } else if (acctInt >= 6000 && acctInt < 7000) {
-      // Expense accounts (6xxx)
+    } else if (acctInt >= 5000 && acctInt < 9000) {
+      // AppFolio income-statement expense accounts can span 5xxx–8xxx
+      // (operating, administrative, utilities, repairs, taxes, etc.).
+      // The previous 6xxx-only scope silently omitted most categories.
+      expenseAccountCount += 1;
       ytdExpenses += Math.abs(ytd);
       mtdExpenses += Math.abs(mtd);
     }
@@ -182,6 +193,12 @@ function extractFromRows(rows: Record<string, unknown>[]): IncomeExtract {
       operatingExpenses: mtdTotalExpenses,
       noi:               mtdTotalIncome - mtdTotalExpenses,
     },
+    diagnostics: {
+      source_row_count: rows.length,
+      income_account_count: incomeAccountCount,
+      expense_account_count: expenseAccountCount,
+      expense_source: (ytdHasSummary && ytdExpenseFromSummary !== 0) ? "summary" : "account_sum",
+    },
   };
 }
 
@@ -210,11 +227,18 @@ export const incomeStatementStrategy: TransformStrategy = {
 
     let ytd: IncomeExtract["ytd"];
     let mtd: IncomeExtract["mtd"];
+    let diagnostics: IncomeExtract["diagnostics"] = {
+      source_row_count: rows.length,
+      income_account_count: 0,
+      expense_account_count: 0,
+      expense_source: "account_sum",
+    };
 
     if (rows.length > 0) {
       const extracted = extractFromRows(rows);
       ytd = extracted.ytd;
       mtd = extracted.mtd;
+      diagnostics = extracted.diagnostics;
     } else {
       // Flat summary object fallback (legacy shape)
       const src = (raw.summary ?? raw) as Record<string, unknown>;
@@ -237,6 +261,7 @@ export const incomeStatementStrategy: TransformStrategy = {
       report_date:      reportDate,
       bronze_report_id: ctx.bronze.id,
       transformed_at:   new Date().toISOString(),
+      extraction_scope: diagnostics,
       summary: {
         report_date: reportDate,
         // YTD
