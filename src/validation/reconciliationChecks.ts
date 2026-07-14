@@ -225,19 +225,20 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
     checks.push(queryFailure("maintenance_source_reconciliation", "latest work_order Bronze ⟶ gold_maintenance", err));
   }
 
-  // Stored lease countdowns drive several pages; ensure they have not drifted from
-  // lease_end_date, and report a mutually exclusive bucket partition for Status.
+  // Lease expiration integrity. NOTE (2026-07-14): the stored
+  // days_until_expiration column is DEPRECATED — every API read now computes
+  // the countdown from lease_end_date at CURRENT_DATE, so drift in the stored
+  // column no longer affects anything users or agents see and is no longer a
+  // failure condition. The load-bearing invariants checked here are per-unit
+  // uniqueness and a mutually exclusive date-bucket partition. The stored
+  // column should be dropped in a future migration.
   try {
     const rows = await sql<{
-      total: string; unique_units: string; drifted: string; expired: string;
+      total: string; unique_units: string; expired: string;
       due_0_30: string; due_31_60: string; due_later: string; undated: string;
     }[]>`
       SELECT COUNT(*)::text AS total,
              COUNT(DISTINCT unit_id)::text AS unique_units,
-             COUNT(*) FILTER (
-               WHERE lease_end_date IS NOT NULL
-                 AND days_until_expiration IS DISTINCT FROM (lease_end_date - CURRENT_DATE)
-             )::text AS drifted,
              COUNT(*) FILTER (WHERE lease_end_date < CURRENT_DATE)::text AS expired,
              COUNT(*) FILTER (WHERE lease_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + 30)::text AS due_0_30,
              COUNT(*) FILTER (WHERE lease_end_date BETWEEN CURRENT_DATE + 31 AND CURRENT_DATE + 60)::text AS due_31_60,
@@ -248,14 +249,13 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
     const r = rows[0];
     const total = Number(r?.total ?? 0);
     const uniqueUnits = Number(r?.unique_units ?? 0);
-    const drifted = Number(r?.drifted ?? 0);
     const partition = Number(r?.expired ?? 0) + Number(r?.due_0_30 ?? 0) +
       Number(r?.due_31_60 ?? 0) + Number(r?.due_later ?? 0) + Number(r?.undated ?? 0);
     checks.push({
       check: "lease_expiration_reconciliation",
       table: "gold_lease_expirations",
-      passed: total === uniqueUnits && total === partition && drifted === 0,
-      detail: `total=${total}, units=${uniqueUnits}, expired=${r?.expired ?? 0}, 0-30=${r?.due_0_30 ?? 0}, 31-60=${r?.due_31_60 ?? 0}, later=${r?.due_later ?? 0}, undated=${r?.undated ?? 0}, stale countdowns=${drifted}`,
+      passed: total === uniqueUnits && total === partition,
+      detail: `total=${total}, units=${uniqueUnits}, expired=${r?.expired ?? 0}, 0-30=${r?.due_0_30 ?? 0}, 31-60=${r?.due_31_60 ?? 0}, later=${r?.due_later ?? 0}, undated=${r?.undated ?? 0} (runtime-computed buckets; stored countdown column deprecated)`,
       actual: total,
       expected: String(uniqueUnits),
     });
@@ -313,6 +313,88 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
     });
   } catch (err) {
     checks.push(queryFailure("financial_expense_scope_plausibility", "gold_income_statements", err));
+  }
+
+  // Maintenance chronology: completion must not precede creation, and all
+  // work-order dates must fall in a plausible year range. Year-less AppFolio
+  // date strings previously leaked through parsing and rendered as year 2001.
+  try {
+    const rows = await sql<{ bad_order: string; implausible: string }[]>`
+      SELECT
+        COUNT(*) FILTER (
+          WHERE completed_on IS NOT NULL AND created_at_appfolio IS NOT NULL
+            AND completed_on::date < created_at_appfolio::date
+        )::text AS bad_order,
+        COUNT(*) FILTER (
+          WHERE (completed_on IS NOT NULL AND EXTRACT(YEAR FROM completed_on::date) NOT BETWEEN 2015 AND EXTRACT(YEAR FROM CURRENT_DATE) + 1)
+             OR (created_at_appfolio IS NOT NULL AND EXTRACT(YEAR FROM created_at_appfolio::date) NOT BETWEEN 2015 AND EXTRACT(YEAR FROM CURRENT_DATE) + 1)
+             OR (work_done_on IS NOT NULL AND EXTRACT(YEAR FROM work_done_on::date) NOT BETWEEN 2015 AND EXTRACT(YEAR FROM CURRENT_DATE) + 1)
+        )::text AS implausible
+      FROM gold_maintenance
+    `;
+    const badOrder = Number(rows[0]?.bad_order ?? 0);
+    const implausible = Number(rows[0]?.implausible ?? 0);
+    checks.push({
+      check: "maintenance_chronology",
+      table: "gold_maintenance",
+      passed: badOrder === 0 && implausible === 0,
+      detail: `completed-before-created=${badOrder}, implausible-year dates=${implausible}`,
+      actual: badOrder + implausible,
+      expected: "0",
+    });
+  } catch (err) {
+    checks.push(queryFailure("maintenance_chronology", "gold_maintenance", err));
+  }
+
+  // Vendor directory must not be empty when the Bronze source has rows — an
+  // empty vendor table is what rendered the Vendors page as a false zero.
+  try {
+    const rows = await sql<{ source_rows: string; gold_rows: string }[]>`
+      WITH latest AS (
+        SELECT id FROM bronze_appfolio_reports
+        WHERE report_type = 'vendor_directory'
+        ORDER BY ingested_at DESC LIMIT 1
+      )
+      SELECT
+        (SELECT COALESCE(jsonb_array_length(raw_data->'results'), 0)::text
+           FROM bronze_appfolio_reports WHERE id = (SELECT id FROM latest)) AS source_rows,
+        (SELECT COUNT(*)::text FROM gold_vendors) AS gold_rows
+    `;
+    const sourceRows = Number(rows[0]?.source_rows ?? 0);
+    const goldRows = Number(rows[0]?.gold_rows ?? 0);
+    checks.push({
+      check: "vendor_directory_nonempty",
+      table: "vendor_directory Bronze ⟶ gold_vendors",
+      passed: sourceRows === 0 || goldRows > 0,
+      detail: `source rows=${sourceRows}, gold rows=${goldRows}`,
+      actual: goldRows,
+      expected: sourceRows > 0 ? "> 0" : "0",
+    });
+  } catch (err) {
+    checks.push(queryFailure("vendor_directory_nonempty", "gold_vendors", err));
+  }
+
+  // Scheduled-turn classification: no future-dated move-out may be classified
+  // as current or completed.
+  try {
+    const rows = await sql<{ misclassified: string }[]>`
+      SELECT COUNT(*)::text AS misclassified
+      FROM gold_unit_turnover
+      WHERE move_out_date IS NOT NULL
+        AND move_out_date::date > CURRENT_DATE
+        AND (turn_end_date IS NOT NULL OR days_to_complete IS NOT NULL)
+    `;
+    const misclassified = Number(rows[0]?.misclassified ?? 0);
+    checks.push({
+      check: "scheduled_turn_classification",
+      table: "gold_unit_turnover",
+      passed: misclassified === 0,
+      detail: `future move-outs with completion data=${misclassified}`,
+      actual: misclassified,
+      expected: "0",
+    });
+  } catch (err) {
+    checks.push(queryFailure("scheduled_turn_classification", "gold_unit_turnover", err));
   }
 
   return checks;

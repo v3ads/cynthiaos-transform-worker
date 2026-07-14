@@ -35,6 +35,11 @@ function toInt(v: unknown): number | null {
 }
 
 // Converts MM/DD/YYYY → YYYY-MM-DD string (null if blank/None)
+const MONTH_NUM: Record<string, string> = {
+  jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
+  jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
+};
+
 function toDateStr(val: unknown): string | null {
   if (!val || val === "None" || val === "") return null;
   const s = String(val).trim();
@@ -43,6 +48,23 @@ function toDateStr(val: unknown): string | null {
   if (mdyMatch) {
     const [, m, d, y] = mdyMatch;
     return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+  }
+  // Year-less AppFolio format: "Fri Jul 10" / "Jul 10". Previously these
+  // returned null (dropping real completion dates); downstream consumers
+  // that received them raw rendered year 2001. Infer the year: current
+  // year, unless that lands >180 days in the future (a previous-year date,
+  // e.g. "Dec 30" appearing in a January report).
+  const named = s.match(/^(?:[A-Za-z]{3,9},?\s+)?([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})$/);
+  if (named) {
+    const mon = MONTH_NUM[named[1].toLowerCase()];
+    if (mon) {
+      const day = named[2].padStart(2, "0");
+      const now = new Date();
+      let year = now.getUTCFullYear();
+      const candidate = new Date(`${year}-${mon}-${day}T00:00:00Z`);
+      if (candidate.getTime() - now.getTime() > 180 * 86400000) year -= 1;
+      return `${year}-${mon}-${day}`;
+    }
   }
   return null;
 }
