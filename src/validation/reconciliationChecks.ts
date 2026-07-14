@@ -88,7 +88,7 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
           SELECT unit_id FROM gold_ids EXCEPT SELECT unit_id FROM source_ids
         ) extra) AS extra_in_gold,
         (SELECT COUNT(*)::text FROM gold_ids
-          WHERE unit_id ~ '^([0-9]+)-\\1-' OR unit_id LIKE '%_%') AS malformed_gold_count
+          WHERE unit_id ~ '^([0-9]+)-\\1-' OR strpos(unit_id, '_') > 0) AS malformed_gold_count
     `;
     const r = rows[0];
     const sourceCount = Number(r?.source_count ?? 0);
