@@ -55,23 +55,34 @@ export function normalizeTenantId(name: unknown, _unit?: unknown): string {
  *   3. Lowercase the entire string.
  *   4. Remove any remaining whitespace characters.
  *   5. Strip characters that are not alphanumeric, hyphen, or underscore.
+ *   6. Repair the legacy underscore-hyphen-underscore separator.
+ *   7. Collapse a duplicated numeric prefix (for example `114-114-a`).
  *
  * Examples:
  *   normalizeUnitId("101")        → "101"
  *   normalizeUnitId("114 - A")   → "114-a"
+ *   normalizeUnitId("114_-_a")   → "114-a"
+ *   normalizeUnitId("114-114-a") → "114-a"
  *   normalizeUnitId("120 - B")   → "120-b"
  *   normalizeUnitId("220_dnu-b") → "220_dnu-b"
  *   normalizeUnitId("  202 B ")  → "202b"
  */
 export function normalizeUnitId(val: unknown): string {
   if (!val) return "unknown";
-  return String(val)
+
+  const normalized = String(val)
     .trim()
-    // Collapse ' - ' (AppFolio student unit separator) into a single hyphen
+    // Collapse ' - ' (AppFolio student unit separator) into a single hyphen.
     .replace(/\s*-\s*/g, "-")
     .toLowerCase()
-    // Remove any remaining whitespace
+    // Remove any remaining whitespace.
     .replace(/\s+/g, "")
-    // Strip characters that are not alphanumeric, hyphen, or underscore
-    .replace(/[^a-z0-9_-]/g, "");
+    // Strip characters that are not alphanumeric, hyphen, or underscore.
+    .replace(/[^a-z0-9_-]/g, "")
+    // Repair historical values such as `114_-_a`.
+    .replace(/_+-_+/g, "-");
+
+  // Repair concatenated values such as `120-120-a`. The base unit is added
+  // separately by the canonical unit-directory expansion logic.
+  return normalized.replace(/^(\d+)-\1-([a-z0-9]+)$/, "$1-$2");
 }

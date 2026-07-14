@@ -11,6 +11,7 @@
 // but never throw or stop the pipeline.
 
 import postgres from "postgres";
+import { runReconciliationChecks } from "./reconciliationChecks";
 
 export interface IntegrityCheck {
   check: string;
@@ -41,6 +42,14 @@ interface TableSpec {
 }
 
 const GOLD_TABLES: TableSpec[] = [
+  {
+    table: "gold_units",
+    critical: true,
+    minRows: 180,
+    badValueChecks: [
+      { column: "unit_id", badValue: "unknown", description: "unit_id sentinel 'unknown'" },
+    ],
+  },
   {
     table: "gold_tenants",
     critical: true,
@@ -233,6 +242,11 @@ export async function runIntegrityChecks(
       detail: `JOIN health check failed: ${err instanceof Error ? err.message : String(err)}`,
     });
   }
+
+  // Reconciliation checks compare canonical entities and endpoint semantics rather
+  // than merely asserting that tables are non-empty. Any failure must prevent the
+  // Status page from reporting “All Clear.”
+  checks.push(...await runReconciliationChecks(sql));
 
   const allPassed = checks.every((c) => c.passed);
 
