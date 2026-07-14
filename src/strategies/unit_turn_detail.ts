@@ -246,7 +246,7 @@ export const unitTurnDetailStrategy: TransformStrategy = {
     await sql`
       DELETE FROM gold_unit_turnover
       WHERE event_type = 'turn'
-        AND bronze_report_id <> ${bronze.id}
+        AND bronze_report_id IS DISTINCT FROM ${bronze.id}
     `;
 
     return { gold_ids: goldIds, skipped: false };
