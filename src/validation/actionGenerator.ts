@@ -78,7 +78,7 @@ export async function generateSystemActions(
            lease_end_date::text AS lease_end_date, monthly_rent::text AS monthly_rent
     FROM v_lease_population
     WHERE is_soonest_future_for_unit AND NOT is_superseded
-      AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+      AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
       AND days_until_expiration <= 90
   `;
   for (const r of renewals) {

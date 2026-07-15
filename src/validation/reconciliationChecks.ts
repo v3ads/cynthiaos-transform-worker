@@ -545,5 +545,31 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
     checks.push(queryFailure("action_layer_consistency", "actions", err));
   }
 
+  // Renewal vs vacating exclusivity (Cindy, July 2026): a unit that has given
+  // notice or is no longer occupied has a pending move-out and must NOT appear
+  // as a renewal decision. This check fails if any unit is simultaneously in
+  // the actionable renewal population and vacating — the exact overlap Cindy
+  // reported (10 units) that this exclusion resolves.
+  try {
+    const rows = await sql<{ overlap: string }[]>`
+      SELECT COUNT(*)::text AS overlap
+      FROM v_lease_population
+      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_released
+        AND NOT is_family_held AND NOT is_employee_held
+        AND is_vacating
+    `;
+    const overlap = Number(rows[0]?.overlap ?? 0);
+    checks.push({
+      check: "renewal_vacating_exclusivity",
+      table: "v_lease_population",
+      passed: overlap === 0,
+      detail: `units both in the renewal population and vacating (notice/move-out)=${overlap}`,
+      actual: overlap,
+      expected: "0",
+    });
+  } catch (err) {
+    checks.push(queryFailure("renewal_vacating_exclusivity", "v_lease_population", err));
+  }
+
   return checks;
 }
