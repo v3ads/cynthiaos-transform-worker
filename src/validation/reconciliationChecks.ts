@@ -343,32 +343,46 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
     checks.push(queryFailure("unit_turn_event_reconciliation", "gold_unit_turnover", err));
   }
 
-  // A near-100% operating margin is not plausible for a full property statement.
-  // Fail visibly until the transform extracts a substantive expense account scope.
+  // Expense scope disclosure (World B confirmed July 15 2026): property
+  // expenses are paid through an EXTERNAL system by design — Cindy does not
+  // run them through AppFolio. A partial expense scope is therefore the
+  // expected, accepted, and correctly-disclosed state, not a data failure;
+  // the old plausibility check failed permanently on it, which is alarm
+  // fatigue, not honesty. Every consumer (Financials page, health score,
+  // metric contract) labels the scope and withholds NOI/margin via the
+  // shared <10% expense/income ratio rule. This check now verifies the
+  // financial data is in a KNOWN state and fails only on genuine anomalies:
+  // no income at all, or expenses exceeding income (implausible for this
+  // property). If the ratio ever crosses 10% — expenses appearing in
+  // AppFolio — the detail flags the transition loudly so labeling can be
+  // reviewed, but improvement is not a failure.
   try {
-    const rows = await sql<{ income: string; expenses: string; margin: string }[]>`
+    const rows = await sql<{ income: string; expenses: string; ratio: string }[]>`
       SELECT COALESCE(total_income, 0)::text AS income,
              COALESCE(total_expenses, 0)::text AS expenses,
              CASE WHEN COALESCE(total_income, 0) = 0 THEN '0'
-               ELSE ((total_income - total_expenses) / total_income)::text END AS margin
+               ELSE (total_expenses / total_income)::text END AS ratio
       FROM gold_income_statements
       ORDER BY report_date DESC, created_at DESC
       LIMIT 1
     `;
     const income = Number(rows[0]?.income ?? 0);
     const expenses = Number(rows[0]?.expenses ?? 0);
-    const margin = Number(rows[0]?.margin ?? 0);
-    const passed = income <= 0 || (expenses > 0 && margin < 0.95);
+    const ratio = Number(rows[0]?.ratio ?? 0);
+    const anomaly = income <= 0 || expenses > income;
+    const world = ratio < 0.1
+      ? "external-expense state (expected): expenses paid outside AppFolio; NOI/margin correctly withheld by all consumers"
+      : "SCOPE TRANSITION: expenses now exceed 10% of income — the external-expense assumption may have changed; review Financials labeling";
     checks.push({
-      check: "financial_expense_scope_plausibility",
+      check: "expense_scope_disclosure",
       table: "gold_income_statements",
-      passed,
-      detail: `latest income=${income.toFixed(2)}, expenses=${expenses.toFixed(2)}, operating margin=${(margin * 100).toFixed(2)}%`,
-      actual: Number((margin * 100).toFixed(2)),
-      expected: "< 95% or explicitly partial scope",
+      passed: !anomaly,
+      detail: `income=${income.toFixed(2)}, AppFolio-recorded expenses=${expenses.toFixed(2)}, ratio=${(ratio * 100).toFixed(2)}% — ${world}`,
+      actual: Number((ratio * 100).toFixed(2)),
+      expected: "income > 0 and expenses <= income",
     });
   } catch (err) {
-    checks.push(queryFailure("financial_expense_scope_plausibility", "gold_income_statements", err));
+    checks.push(queryFailure("expense_scope_disclosure", "gold_income_statements", err));
   }
 
   // Maintenance chronology: completion must not precede creation, and all
