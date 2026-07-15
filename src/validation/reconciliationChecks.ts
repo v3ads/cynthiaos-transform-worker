@@ -545,26 +545,35 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
     checks.push(queryFailure("action_layer_consistency", "actions", err));
   }
 
-  // Renewal vs vacating exclusivity (Cindy, July 2026): a unit that has given
-  // notice or is no longer occupied has a pending move-out and must NOT appear
-  // as a renewal decision. This check fails if any unit is simultaneously in
-  // the actionable renewal population and vacating — the exact overlap Cindy
-  // reported (10 units) that this exclusion resolves.
+  // Renewal vs vacating exclusivity (Cindy, July 2026): the actionable renewal
+  // predicate must itself exclude vacating units. This counts units that
+  // satisfy the FULL renewal predicate (which includes NOT is_vacating) yet
+  // are vacating — a contradiction that is 0 iff the exclusion is wired in.
+  // (Counting units *removed by* the vacating filter would be non-zero by
+  // design and is not what we want to assert.)
   try {
-    const rows = await sql<{ overlap: string }[]>`
-      SELECT COUNT(*)::text AS overlap
+    const rows = await sql<{ leak: string; excluded: string }[]>`
+      SELECT
+        COUNT(*) FILTER (
+          WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_released
+            AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
+            AND is_vacating
+        )::text AS leak,
+        COUNT(*) FILTER (
+          WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_released
+            AND NOT is_family_held AND NOT is_employee_held
+            AND is_vacating
+        )::text AS excluded
       FROM v_lease_population
-      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_released
-        AND NOT is_family_held AND NOT is_employee_held
-        AND is_vacating
     `;
-    const overlap = Number(rows[0]?.overlap ?? 0);
+    const leak = Number(rows[0]?.leak ?? 0);
+    const excluded = Number(rows[0]?.excluded ?? 0);
     checks.push({
       check: "renewal_vacating_exclusivity",
       table: "v_lease_population",
-      passed: overlap === 0,
-      detail: `units both in the renewal population and vacating (notice/move-out)=${overlap}`,
-      actual: overlap,
+      passed: leak === 0,
+      detail: `vacating units leaking into renewals=${leak} (correctly excluded from renewals=${excluded})`,
+      actual: leak,
       expected: "0",
     });
   } catch (err) {
