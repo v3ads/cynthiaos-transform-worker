@@ -471,7 +471,7 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
         COUNT(*) FILTER (WHERE unit_status IS NULL
           OR unit_status NOT IN ('occupied','vacant','notice'))::text AS other_status,
         COUNT(*) FILTER (WHERE exclude_from_occupancy)::text   AS excluded
-      FROM gold_units
+      FROM v_unit_occupancy
     `;
     const r = rows[0];
     const total = Number(r?.total ?? 0);
@@ -480,14 +480,14 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
     const eligible = total - Number(r?.excluded ?? 0);
     checks.push({
       check: "occupancy_partition",
-      table: "gold_units",
+      table: "v_unit_occupancy",
       passed: total > 0 && partition === total && other === 0,
       detail: `total=${total}, occupied=${r?.occupied}, vacant=${r?.vacant}, notice=${r?.notice}, unrecognized-status=${other}, excluded=${r?.excluded}, occupancy-eligible=${eligible}`,
       actual: partition,
       expected: String(total),
     });
   } catch (err) {
-    checks.push(queryFailure("occupancy_partition", "gold_units", err));
+    checks.push(queryFailure("occupancy_partition", "v_unit_occupancy", err));
   }
 
   return checks;
