@@ -447,6 +447,12 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
         );
       }
 
+      // Regenerate actions from current Gold even when nothing new promoted,
+      // so the queue reflects the latest canonical state (Release 2).
+      await generateSystemActions(sql).catch((err) =>
+        console.error(`[${SERVICE_NAME}] generateSystemActions (empty queue) failed:`, err)
+      );
+
       res.status(200).json({
         success: true,
         processed: false,
@@ -582,6 +588,23 @@ app.get("/validation/logs", async (_req: Request, res: Response) => {
       LIMIT 100
     `;
     res.status(200).json({ success: true, count: logs.length, logs });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
+// ── POST /actions/generate ────────────────────────────────────────────────
+// On-demand system-action regeneration from current Gold, independent of the
+// promotion queue. Idempotent; safe to call anytime.
+app.post("/actions/generate", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const result = await generateSystemActions(sql);
+    res.status(200).json({ success: true, ...result });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(500).json({ success: false, error: message });
