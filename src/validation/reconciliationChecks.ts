@@ -200,6 +200,10 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
         WHERE b.report_type = 'work_order'
           AND b.report_date IS NOT DISTINCT FROM l.report_date
           AND NULLIF(elem->>'WorkOrderId', '') IS NOT NULL
+          -- Parity with the promotion, which coerces WorkOrderId via toInt and
+          -- skips non-integer ids. Counting only integer-castable ids here
+          -- keeps the source total defined identically on both sides.
+          AND (elem->>'WorkOrderId') ~ '^\\s*\\d+\\s*$'
       ), gold_ids AS (
         SELECT DISTINCT work_order_id::text AS work_order_id FROM gold_maintenance
       )
@@ -207,17 +211,20 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
         (SELECT COUNT(*)::text FROM source_ids) AS source_count,
         (SELECT COUNT(*)::text FROM gold_ids) AS gold_count,
         (SELECT COUNT(*)::text FROM (SELECT * FROM source_ids EXCEPT SELECT * FROM gold_ids) x) AS missing,
-        (SELECT COUNT(*)::text FROM (SELECT * FROM gold_ids EXCEPT SELECT * FROM source_ids) x) AS stale
+        (SELECT COUNT(*)::text FROM (SELECT * FROM gold_ids EXCEPT SELECT * FROM source_ids) x) AS stale,
+        (SELECT string_agg(work_order_id, ', ' ORDER BY work_order_id)
+           FROM (SELECT * FROM source_ids EXCEPT SELECT * FROM gold_ids LIMIT 20) x) AS missing_ids
     `;
     const sourceCount = Number(rows[0]?.source_count ?? 0);
     const goldCount = Number(rows[0]?.gold_count ?? 0);
     const missing = Number(rows[0]?.missing ?? 0);
     const stale = Number(rows[0]?.stale ?? 0);
+    const missingIds = (rows[0] as { missing_ids?: string })?.missing_ids ?? null;
     checks.push({
       check: "maintenance_source_reconciliation",
       table: "latest work_order Bronze ⟶ gold_maintenance",
       passed: sourceCount === goldCount && missing === 0 && stale === 0,
-      detail: `source unique work orders=${sourceCount}, Gold=${goldCount}, missing=${missing}, stale=${stale}`,
+      detail: `source unique work orders=${sourceCount}, Gold=${goldCount}, missing=${missing}, stale=${stale}${missingIds ? ` (missing ids: ${missingIds})` : ''}`,
       actual: goldCount,
       expected: String(sourceCount),
     });

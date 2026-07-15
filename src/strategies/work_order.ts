@@ -90,8 +90,14 @@ export const workOrderStrategy: TransformStrategy = {
   // ── Silver normalisation ────────────────────────────────────────────────────
   normalizeSilver(ctx: TransformContext): SilverNormalizeResult {
     const raw = ctx.bronze.raw_data;
+    // Array-shape parity with maintenance_source_reconciliation: the check
+    // counts source rows from results/data/rows, so the promotion must read
+    // the same set or rows counted as source never reach Gold (the July 15
+    // 4-missing-work-order gap: the check saw a shape the promotion didn't).
     const rows = Array.isArray(raw.results)
       ? (raw.results as Record<string, unknown>[])
+      : Array.isArray(raw.data)
+      ? (raw.data as Record<string, unknown>[])
       : Array.isArray(raw.rows)
       ? (raw.rows as Record<string, unknown>[])
       : [];
@@ -178,9 +184,16 @@ export const workOrderStrategy: TransformStrategy = {
     }
 
     const goldIds: string[] = [];
+    const skippedIds: unknown[] = [];
 
     for (const row of rows) {
-      if (row.work_order_id == null) continue;
+      if (row.work_order_id == null) {
+        // WorkOrderId was null or failed integer coercion (toInt). These rows
+        // count toward the reconciliation check's source total but never reach
+        // Gold — surfacing them turns a silent gap into a visible one.
+        skippedIds.push(row.work_order_number ?? row.service_request_number ?? '(no id)');
+        continue;
+      }
 
       const inserted = await sql<{ id: string }[]>`
         INSERT INTO gold_maintenance (
@@ -344,6 +357,13 @@ export const workOrderStrategy: TransformStrategy = {
     // retained indefinitely (452 Gold rows versus 309 current source IDs).
     // Remove stale rows only after every source row has promoted successfully and
     // only when the incoming snapshot is large enough to be plausibly complete.
+    if (skippedIds.length > 0) {
+      console.warn(
+        `[work_order] ${skippedIds.length} source rows skipped (null/non-integer WorkOrderId), ` +
+        `not promoted to Gold — these count toward the reconciliation source total. ` +
+        `Refs: ${skippedIds.slice(0, 20).map(String).join(', ')}`
+      );
+    }
     const currentGoldCountRows = await sql<{ count: string }[]>`
       SELECT COUNT(*)::text AS count FROM gold_maintenance
     `;
