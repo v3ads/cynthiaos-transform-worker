@@ -355,6 +355,38 @@ export const workOrderStrategy: TransformStrategy = {
       (currentGoldCount === 0 || uniqueSourceCount >= Math.floor(currentGoldCount * 0.5));
 
     if (snapshotLooksComplete && goldIds.length === uniqueSourceCount) {
+      // Decision 6 (July 15 2026): retain a rolling 1-month history of rows
+      // removed by snapshot semantics, so short-horizon trend/repeat-work
+      // analysis survives the deletion. Older archive rows are purged.
+      // Non-fatal by design: if gold_maintenance's schema drifts from the
+      // history table, promotion must still complete — archive failure only
+      // warns.
+      try {
+        await sql`
+          CREATE TABLE IF NOT EXISTS gold_maintenance_history
+          (LIKE gold_maintenance INCLUDING ALL)
+        `;
+        await sql`
+          ALTER TABLE gold_maintenance_history
+          ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        `;
+        await sql`
+          INSERT INTO gold_maintenance_history
+          SELECT gm.*, NOW() AS archived_at
+          FROM gold_maintenance gm
+          WHERE gm.bronze_report_id IS DISTINCT FROM ${bronze.id}
+          ON CONFLICT DO NOTHING
+        `;
+        await sql`
+          DELETE FROM gold_maintenance_history
+          WHERE archived_at < NOW() - INTERVAL '31 days'
+        `;
+      } catch (err) {
+        console.warn(
+          `[work_order] history archive failed (non-fatal, promotion continues): ` +
+          `${err instanceof Error ? err.message : String(err)}`
+        );
+      }
       await sql`
         DELETE FROM gold_maintenance
         WHERE bronze_report_id IS DISTINCT FROM ${bronze.id}

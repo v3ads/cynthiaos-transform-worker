@@ -453,5 +453,42 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
     checks.push(queryFailure("scheduled_turn_classification", "gold_unit_turnover", err));
   }
 
+  // Occupancy partition (R1 item 1.3, July 15 2026): occupied/notice/vacant
+  // must form an EXACT partition of the canonical roster — no unit uncounted,
+  // none double-counted, and the occupancy-eligible denominator must equal
+  // total minus excluded units. This is the invariant behind every
+  // occupancy/vacancy rate the product displays.
+  try {
+    const rows = await sql<{
+      total: string; occupied: string; vacant: string; notice: string;
+      other_status: string; excluded: string;
+    }[]>`
+      SELECT
+        COUNT(*)::text AS total,
+        COUNT(*) FILTER (WHERE unit_status = 'occupied')::text AS occupied,
+        COUNT(*) FILTER (WHERE unit_status = 'vacant')::text   AS vacant,
+        COUNT(*) FILTER (WHERE unit_status = 'notice')::text   AS notice,
+        COUNT(*) FILTER (WHERE unit_status IS NULL
+          OR unit_status NOT IN ('occupied','vacant','notice'))::text AS other_status,
+        COUNT(*) FILTER (WHERE exclude_from_occupancy)::text   AS excluded
+      FROM gold_units
+    `;
+    const r = rows[0];
+    const total = Number(r?.total ?? 0);
+    const partition = Number(r?.occupied ?? 0) + Number(r?.vacant ?? 0) + Number(r?.notice ?? 0);
+    const other = Number(r?.other_status ?? 0);
+    const eligible = total - Number(r?.excluded ?? 0);
+    checks.push({
+      check: "occupancy_partition",
+      table: "gold_units",
+      passed: total > 0 && partition === total && other === 0,
+      detail: `total=${total}, occupied=${r?.occupied}, vacant=${r?.vacant}, notice=${r?.notice}, unrecognized-status=${other}, excluded=${r?.excluded}, occupancy-eligible=${eligible}`,
+      actual: partition,
+      expected: String(total),
+    });
+  } catch (err) {
+    checks.push(queryFailure("occupancy_partition", "gold_units", err));
+  }
+
   return checks;
 }

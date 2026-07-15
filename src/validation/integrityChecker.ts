@@ -250,5 +250,33 @@ export async function runIntegrityChecks(
 
   const allPassed = checks.every((c) => c.passed);
 
+  // Persist structured results so the API can join live confidence states
+  // onto affected KPIs (the management metric contract, July 15 2026 plan
+  // item 1.6). Latest run replaces the previous snapshot — history lives in
+  // pipeline_logs, this table answers only "what is failing right now".
+  try {
+    await sql`
+      CREATE TABLE IF NOT EXISTS integrity_check_results (
+        check_name  TEXT NOT NULL,
+        table_name  TEXT NOT NULL,
+        passed      BOOLEAN NOT NULL,
+        detail      TEXT,
+        run_at      TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (check_name, table_name)
+      )
+    `;
+    await sql`DELETE FROM integrity_check_results`;
+    for (const c of checks) {
+      await sql`
+        INSERT INTO integrity_check_results (check_name, table_name, passed, detail, run_at)
+        VALUES (${c.check}, ${c.table ?? ''}, ${c.passed}, ${c.detail ?? null}, ${runAt})
+        ON CONFLICT (check_name, table_name) DO UPDATE
+          SET passed = EXCLUDED.passed, detail = EXCLUDED.detail, run_at = EXCLUDED.run_at
+      `;
+    }
+  } catch (err) {
+    console.warn(`[integrity] result persistence failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   return { run_at: runAt, all_passed: allPassed, checks };
 }
