@@ -17,6 +17,7 @@ import {
   logGoldPromotion,
   logIntegrityReport,
 } from "./validation";
+import { generateSystemActions } from "./validation/actionGenerator";
 import { repairLease120UnitId } from "./repairs/repairLease120UnitId";
 
 const app: express.Express = express();
@@ -516,6 +517,19 @@ app.post("/gold/run", async (_req: Request, res: Response) => {
       })
       .catch((err) => {
         console.error(`[${SERVICE_NAME}] runIntegrityChecks failed (non-fatal):`, err);
+      });
+
+    // ── ACTION GENERATION: derive system actions from the fresh Gold data ──
+    // (Release 2, item 2.2). Idempotent on natural_key; fire-and-forget.
+    generateSystemActions(sql)
+      .then((r) => {
+        console.log(
+          `[${SERVICE_NAME}] POST-GOLD ACTIONS — generated=${r.generated} resolved=${r.resolved} ` +
+          `by_type=${JSON.stringify(r.by_type)}`
+        );
+      })
+      .catch((err) => {
+        console.error(`[${SERVICE_NAME}] generateSystemActions failed (non-fatal):`, err);
       });
 
     res.status(200).json({
