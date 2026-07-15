@@ -17,6 +17,7 @@ import {
   logGoldPromotion,
   logIntegrityReport,
 } from "./validation";
+import { repairLease120UnitId } from "./repairs/repairLease120UnitId";
 
 const app: express.Express = express();
 const PORT = parseInt(process.env.PORT ?? "3002", 10);
@@ -75,6 +76,15 @@ async function checkDatabaseConnectivity(): Promise<void> {
     // Ensure pipeline_logs table exists on every startup
     await ensurePipelineLogsTable(sql);
     console.log(`[${SERVICE_NAME}] pipeline_logs table verified`);
+
+    // One-time, idempotent repair for the known doubled-prefix lease unit ID.
+    // The repair validates the exact tenant and lease end date before touching data.
+    const lease120Repair = await repairLease120UnitId(sql);
+    console.log(
+      `[${SERVICE_NAME}] lease 120-a repair — reason=${lease120Repair.reason} ` +
+        `unit_id=${lease120Repair.unit_id ?? "none"} ` +
+        `lease_end_date=${lease120Repair.lease_end_date ?? "none"}`
+    );
 
     await sql.end();
   } catch (err) {
