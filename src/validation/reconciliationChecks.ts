@@ -511,5 +511,39 @@ export async function runReconciliationChecks(sql: postgres.Sql): Promise<Integr
     checks.push(queryFailure("occupancy_partition", "v_unit_occupancy", err));
   }
 
+  // Action layer consistency (Release 2 item 2.6): Today and Tasks both read
+  // the actions table, so its internal integrity is what keeps them in sync.
+  // Verify: no open action has a resolved-only field set inconsistently
+  // (completed_at present while status is open), and every system action
+  // carries a natural_key (its dedupe identity) and a recognized type.
+  try {
+    const rows = await sql<{
+      total_open: string; bad_completed: string; system_no_key: string; unknown_type: string;
+    }[]>`
+      SELECT
+        COUNT(*) FILTER (WHERE status IN ('open','in_progress'))::text AS total_open,
+        COUNT(*) FILTER (WHERE status IN ('open','in_progress') AND completed_at IS NOT NULL)::text AS bad_completed,
+        COUNT(*) FILTER (WHERE source = 'system' AND natural_key IS NULL)::text AS system_no_key,
+        COUNT(*) FILTER (WHERE type NOT IN (
+          'renewal_due','holdover','stale_closeout','overdue_turn','broken_promise',
+          'no_recent_contact','ad_hoc'))::text AS unknown_type
+      FROM actions
+    `;
+    const r = rows[0];
+    const badCompleted = Number(r?.bad_completed ?? 0);
+    const systemNoKey = Number(r?.system_no_key ?? 0);
+    const unknownType = Number(r?.unknown_type ?? 0);
+    checks.push({
+      check: "action_layer_consistency",
+      table: "actions",
+      passed: badCompleted === 0 && systemNoKey === 0 && unknownType === 0,
+      detail: `open=${r?.total_open}, open-with-completed_at=${badCompleted}, system-without-natural_key=${systemNoKey}, unknown-type=${unknownType}`,
+      actual: badCompleted + systemNoKey + unknownType,
+      expected: "0",
+    });
+  } catch (err) {
+    checks.push(queryFailure("action_layer_consistency", "actions", err));
+  }
+
   return checks;
 }
