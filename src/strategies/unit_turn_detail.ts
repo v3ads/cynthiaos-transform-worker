@@ -190,6 +190,32 @@ export const unitTurnDetailStrategy: TransformStrategy = {
 
     const goldIds: string[] = [];
 
+    // Constraint parity (July 15 2026): a unique constraint on
+    // gold_unit_turnover was created out-of-band as uq_unit_turnover_unit_moveout
+    // on (unit_id, move_out_date), which disagrees with this strategy's
+    // ON CONFLICT target (bronze_report_id, unit_id, move_out_date). The
+    // mismatch made cross-snapshot upserts throw a duplicate-key error that
+    // 500ed the entire /gold/run pipeline (blocking the 4 newest work orders
+    // and everything else behind them). Normalize the constraint to exactly
+    // what the upsert targets. Idempotent; runs once per promotion cheaply.
+    try {
+      await sql`ALTER TABLE gold_unit_turnover DROP CONSTRAINT IF EXISTS uq_unit_turnover_unit_moveout`;
+      await sql`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'uq_unit_turnover_bronze_unit_moveout'
+          ) THEN
+            ALTER TABLE gold_unit_turnover
+              ADD CONSTRAINT uq_unit_turnover_bronze_unit_moveout
+              UNIQUE (bronze_report_id, unit_id, move_out_date);
+          END IF;
+        END $$;
+      `;
+    } catch (err) {
+      console.warn(`[unit_turn] constraint normalization warning (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
     for (const row of rows) {
       const unitId             = normalizeUnitId(row.unit_id ?? "unknown");
       const moveOutDate        = row.move_out_date         as string | null ?? null;
