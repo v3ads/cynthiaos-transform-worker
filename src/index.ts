@@ -1,6 +1,7 @@
 import express, { Request, Response } from "express";
 import postgres from "postgres";
 import http from "http";
+import { timingSafeEqual } from "crypto";
 
 import {
   BronzeAppfolioReport,
@@ -31,7 +32,11 @@ function selfPost(path: string): void {
     port: PORT,
     path,
     method: "POST",
-    headers: { "Content-Type": "application/json", "Content-Length": 0 },
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": 0,
+      "X-Worker-Key": process.env.WORKER_SHARED_SECRET ?? "",
+    },
   };
   const req = http.request(options, (res) => {
     let body = "";
@@ -47,6 +52,56 @@ function selfPost(path: string): void {
 }
 
 app.use(express.json());
+
+// ── Service auth boundary ─────────────────────────────────────────────────────
+// The worker was fully public: an unauthenticated GET to /validation/integrity
+// on its Railway URL returned the entire Gold integrity report — record counts,
+// reconciliation detail and portfolio income totals — and POST /transform/run,
+// /gold/run and /actions/generate could be triggered by anyone on the internet.
+//
+// This is a service-to-service boundary, not a user one: the callers (the
+// Vercel transform-proxy, cynthiaos-api, the cron worker, and this worker's own
+// triggerGold self-call) have no Supabase session to present, so a shared
+// secret is the right primitive rather than JWKS/JWT.
+//
+// Deny-by-default and FAIL-CLOSED: if WORKER_SHARED_SECRET is unset the worker
+// rejects everything except /health. It never falls back to open.
+const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET ?? "";
+const PUBLIC_WORKER_PATHS = new Set(["/health"]);
+
+export function presentedWorkerKey(req: Request): string {
+  const header = req.header("x-worker-key");
+  if (header) return header;
+  const auth = req.header("authorization") ?? "";
+  return auth.startsWith("Bearer ") ? auth.slice(7) : "";
+}
+
+app.use((req: Request, res: Response, next) => {
+  if (PUBLIC_WORKER_PATHS.has(req.path)) return next();
+
+  if (!WORKER_SHARED_SECRET) {
+    console.error(
+      `[${SERVICE_NAME}] WORKER_SHARED_SECRET is not set — denying ${req.method} ${req.path}. ` +
+      `Set it on this service and on every caller (cynthiaos-api, cron worker, Vercel).`
+    );
+    res.status(503).json({ error: "worker_auth_unconfigured" });
+    return;
+  }
+
+  const presented = presentedWorkerKey(req);
+  const expected = Buffer.from(WORKER_SHARED_SECRET);
+  const actual = Buffer.from(presented);
+  const ok =
+    actual.length === expected.length && timingSafeEqual(actual, expected);
+
+  if (!ok) {
+    console.warn(`[${SERVICE_NAME}] unauthorized ${req.method} ${req.path}`);
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+
+  next();
+});
 
 // ── Database client ───────────────────────────────────────────────────────────
 function getDb(): postgres.Sql {
@@ -208,7 +263,14 @@ async function triggerGold(): Promise<void> {
   const port = process.env.PORT ?? "3002";
   const url = `http://localhost:${port}/gold/run`;
   try {
-    const resp = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" } });
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // Self-call crosses the auth middleware like any other request.
+        "X-Worker-Key": process.env.WORKER_SHARED_SECRET ?? "",
+      },
+    });
     const body = await resp.json() as Record<string, unknown>;
     if (body.processed) {
       console.log(`[${SERVICE_NAME}] triggerGold — gold promotion succeeded gold_ids=${JSON.stringify(body.gold_ids)}`);
@@ -643,7 +705,18 @@ app.get("/strategies", (_req: Request, res: Response) => {
 });
 
 // ── Health check ──────────────────────────────────────────────────────────────
+// /health is the only unauthenticated route (Railway probes it), so it is
+// deliberately minimal — no strategy inventory, no validation-layer internals.
+// Those moved to GET /strategies and GET /health/detail, both authenticated.
 app.get("/health", (_req: Request, res: Response) => {
+  res.status(200).json({
+    service: SERVICE_NAME,
+    status: "ok",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get("/health/detail", (_req: Request, res: Response) => {
   res.status(200).json({
     service: SERVICE_NAME,
     status: "ok",
