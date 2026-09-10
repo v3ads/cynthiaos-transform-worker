@@ -110,11 +110,20 @@ export const tenantDirectoryStrategy: TransformStrategy = {
       const unitId = String(
         r.Unit ?? r.unit ?? r.unit_id ?? r.unit_number ?? "unknown"
       ).trim();
-      // AppFolio Emails is an array of objects; extract first email
+      // AppFolio Emails can be:
+      // 1) array of objects with EmailAddress or email
+      // 2) array of strings
+      // 3) a single string
       let email: string | null = null;
       if (Array.isArray(r.Emails) && (r.Emails as any[]).length > 0) {
         const firstEmail = (r.Emails as any[])[0];
-        email = cleanEmail(firstEmail?.EmailAddress ?? firstEmail?.email ?? firstEmail);
+        if (typeof firstEmail === 'string') {
+          email = cleanEmail(firstEmail);
+        } else {
+          email = cleanEmail(firstEmail?.EmailAddress ?? firstEmail?.email ?? firstEmail);
+        }
+      } else if (typeof r.Emails === 'string') {
+        email = cleanEmail(r.Emails);
       } else {
         email = cleanEmail(r.email ?? r.email_address ?? r.contact_email ?? r.PrimaryTenantEmail);
       }
